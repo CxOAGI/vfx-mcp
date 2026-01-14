@@ -234,8 +234,8 @@ def register_basic_video_tools(
 
         try:
             inputs = [ffmpeg.input(path) for path in input_paths]
-            # Concatenate without specifying stream counts - let ffmpeg auto-detect
-            stream = ffmpeg.concat(*inputs)
+            # Concatenate ensuring video AND audio streams are included (v=1, a=1)
+            stream = ffmpeg.concat(*inputs, v=1, a=1)
             output = create_standard_output(stream, output_path)
             ffmpeg.run(output, overwrite_output=True)
             return f"Videos concatenated successfully and saved to {output_path}"
