@@ -180,7 +180,7 @@ def register_video_effects_tools(
                     str(int(height)),
                 )
 
-            output: ffmpeg.Stream = create_standard_output(stream, output_path)
+            output: ffmpeg.Stream = create_standard_output(stream, output_path, map="0:a?")
             _ = ffmpeg.run(output, overwrite_output=True)
             return f"{filter.title()} filter applied and saved to {output_path}"
         except ffmpeg.Error as e:
