@@ -190,7 +190,9 @@ def register_basic_video_tools(
                     f"Resizing video to height {height}px",
                 )
 
-            output = create_standard_output(stream, output_path)
+            # Use map='0:a?' to optionally map audio from the first input if it exists
+            # This avoids the need for explicit probing while preserving audio
+            output = create_standard_output(stream, output_path, map="0:a?")
             ffmpeg.run(output, overwrite_output=True)
             return f"Video resized and saved to {output_path}"
         except ffmpeg.Error as e:

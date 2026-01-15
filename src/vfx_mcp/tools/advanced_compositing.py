@@ -112,6 +112,7 @@ def register_compositing_tools(
                 output_path,
                 vcodec="libx264",
                 pix_fmt="yuv420p",
+                map="0:a?",
             )
             ffmpeg.run(output, overwrite_output=True)
 
@@ -205,7 +206,7 @@ def register_compositing_tools(
                     luma_radius=f"1:{blur_amount}",
                 )
 
-            output: ffmpeg.Stream = create_standard_output(stream, output_path)
+            output: ffmpeg.Stream = create_standard_output(stream, output_path, map="0:a?")
             ffmpeg.run(output, overwrite_output=True)
 
             return (
