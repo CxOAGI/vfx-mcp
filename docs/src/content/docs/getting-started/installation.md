@@ -13,7 +13,7 @@ The project includes a comprehensive Nix flake that provides all necessary depen
 
 ```bash
 # Clone the repository
-git clone https://github.com/conneroisu/vfx-mcp.git
+git clone https://github.com/CxOAGI/vfx-mcp.git
 cd vfx-mcp
 
 # Enter the Nix development environment
@@ -32,7 +32,7 @@ If you prefer not to use Nix, you can install dependencies manually:
 
 ```bash
 # Clone the repository  
-git clone https://github.com/conneroisu/vfx-mcp.git
+git clone https://github.com/CxOAGI/vfx-mcp.git
 cd vfx-mcp
 
 # Install FFmpeg (required for video processing)
@@ -57,7 +57,7 @@ pip install -r requirements.txt
 
 ### System Requirements
 
-- **Python**: 3.9 or higher
+- **Python**: 3.13 or higher
 - **FFmpeg**: Latest version (with full codec support)
 - **Operating System**: Linux, macOS, or Windows
 - **Memory**: 4GB RAM minimum (8GB recommended for large videos)
@@ -196,7 +196,7 @@ ffmpeg -version
 python --version
 
 # Use specific Python version if needed
-python3.9 -m pip install uv
+python3.13 -m pip install uv
 ```
 
 **Permission errors:**
@@ -221,7 +221,7 @@ If you encounter issues:
 
 1. Check the [Troubleshooting Guide](/support/troubleshooting/)
 2. Review the [FAQ](/support/faq/)
-3. File an issue on [GitHub](https://github.com/conneroisu/vfx-mcp/issues)
+3. File an issue on [GitHub](https://github.com/CxOAGI/vfx-mcp/issues)
 
 ## 🎯 Next Steps
 

@@ -1,14 +1,14 @@
 [project]
-name = "vfx-mcp"
-version = "0.1.0"
+name = "cxoagi-vfx-mcp"
+version = "0.2.0"
 description = "Video editing MCP server using FastMCP and ffmpeg-python"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Conner Ohnesorge", email = "conneroisu@outlook.com"}
+    {name = "CxOAGI", email = "james@cxoagi.com"}
 ]
 maintainers = [
-    {name = "Conner Ohnesorge", email = "conneroisu@outlook.com"}
+    {name = "CxOAGI", email = "james@cxoagi.com"}
 ]
 keywords = ["mcp", "video-editing", "ffmpeg", "ai", "automation"]
 classifiers = [
@@ -19,7 +19,6 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Video",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Framework :: FastAPI",
 ]
 requires-python = ">=3.13"
 dependencies = [
@@ -28,10 +27,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/conneroisu/vfx-mcp"
-Repository = "https://github.com/conneroisu/vfx-mcp"
-Documentation = "https://github.com/conneroisu/vfx-mcp#readme"
-Issues = "https://github.com/conneroisu/vfx-mcp/issues"
+Homepage = "https://github.com/CxOAGI/vfx-mcp"
+Repository = "https://github.com/CxOAGI/vfx-mcp"
+Documentation = "https://github.com/CxOAGI/vfx-mcp#readme"
+Issues = "https://github.com/CxOAGI/vfx-mcp/issues"
 
 [project.scripts]
 vfx-mcp = "vfx_mcp.core.server:main"
@@ -76,6 +75,8 @@ markers = [
 [tool.ruff]
 target-version = "py313"
 line-length = 88
+# Vendored FastMCP/ffmpeg type stubs are not our code to lint or format.
+extend-exclude = ["src/vfx_mcp/stubs"]
 lint.select = [
     "E",  # pycodestyle errors
     "W",  # pycodestyle warnings
@@ -85,7 +86,9 @@ lint.select = [
     "UP", # pyupgrade
     "C4", # flake8-comprehensions
 ]
-lint.ignore = []
+# Line length is enforced by `ruff format`, which leaves long string/URL
+# literals intact intentionally; linting E501 on top of that is noise.
+lint.ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["F841"]  # Allow unused variables in tests

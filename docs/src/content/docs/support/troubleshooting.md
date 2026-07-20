@@ -68,11 +68,11 @@ This guide covers common issues you might encounter while using the VFX MCP Serv
 
 2. **Check Python Version**:
    ```bash
-   # Verify Python 3.9+
+   # Verify Python 3.13+
    python --version
    
    # Use specific version if needed
-   python3.9 -m pip install -r requirements.txt
+   python3.13 -m pip install -r requirements.txt
    ```
 
 3. **Virtual Environment Issues**:
@@ -525,7 +525,7 @@ When reporting issues, please include:
 
 ### Community Support
 
-- **GitHub Issues**: [Report bugs and request features](https://github.com/conneroisu/vfx-mcp/issues)
+- **GitHub Issues**: [Report bugs and request features](https://github.com/CxOAGI/vfx-mcp/issues)
 - **FAQ**: Check [common questions](/support/faq/)
 - **Performance Guide**: See [optimization tips](/support/performance/)
 
@@ -542,7 +542,7 @@ If all else fails, perform a clean installation:
 rm -rf vfx-mcp/
 
 # 2. Fresh clone
-git clone https://github.com/conneroisu/vfx-mcp.git
+git clone https://github.com/CxOAGI/vfx-mcp.git
 cd vfx-mcp
 
 # 3. Clean Python environment
@@ -580,4 +580,4 @@ EOF
 
 ---
 
-**Still having issues?** Check our [FAQ](/support/faq/) or [file an issue](https://github.com/conneroisu/vfx-mcp/issues) with detailed information about your problem.
+**Still having issues?** Check our [FAQ](/support/faq/) or [file an issue](https://github.com/CxOAGI/vfx-mcp/issues) with detailed information about your problem.
