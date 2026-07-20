@@ -452,10 +452,7 @@ def register_basic_video_tools(
             finally:
                 if os.path.exists(list_path):
                     os.unlink(list_path)
-            return (
-                "Videos concatenated (lossless copy) and saved to "
-                f"{resolved_output}"
-            )
+            return f"Videos concatenated (lossless copy) and saved to {resolved_output}"
 
         # Re-encode path with per-input normalization.
         width, height, fps = _target_geometry(metas)

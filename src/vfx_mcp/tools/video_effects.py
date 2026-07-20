@@ -377,9 +377,7 @@ def register_video_effects_tools(
                 current_speed /= 0.5
 
             if current_speed != 1.0:
-                audio_stream = ffmpeg.filter(
-                    audio_stream, "atempo", str(current_speed)
-                )
+                audio_stream = ffmpeg.filter(audio_stream, "atempo", str(current_speed))
 
             # Both video and audio are re-encoded. create_standard_output
             # only maps a single stream, so build the two-stream output
@@ -394,10 +392,7 @@ def register_video_effects_tools(
         await run_ffmpeg_async(output, ctx=ctx, output_path=resolved_output)
 
         speed_desc = "faster" if speed > 1.0 else "slower"
-        return (
-            f"Video speed changed {speed_desc} ({speed}x) and saved to "
-            f"{output_path}"
-        )
+        return f"Video speed changed {speed_desc} ({speed}x) and saved to {output_path}"
 
     @mcp.tool
     async def generate_thumbnail(
@@ -456,9 +451,7 @@ def register_video_effects_tools(
             # yields an even dimension when only one axis is specified.
             scale_width = width if width is not None else -2
             scale_height = height if height is not None else -2
-            stream = ffmpeg.filter(
-                stream, "scale", str(scale_width), str(scale_height)
-            )
+            stream = ffmpeg.filter(stream, "scale", str(scale_width), str(scale_height))
 
         output: ffmpeg.Stream = ffmpeg.output(stream, resolved_output, vframes=1)
         await run_ffmpeg_async(output, ctx=ctx, output_path=resolved_output)

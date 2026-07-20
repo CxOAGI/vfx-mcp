@@ -482,9 +482,7 @@ def register_audio_tools(mcp: FastMCP[Any]) -> None:
 
         stream: Any = ffmpeg.input(safe_in)
         # Fade-in always starts at the beginning of the clip (st defaults to 0).
-        audio: Any = ffmpeg.filter(
-            stream.audio, "afade", type="in", duration=duration
-        )
+        audio: Any = ffmpeg.filter(stream.audio, "afade", type="in", duration=duration)
 
         if has_video:
             output: Any = ffmpeg.output(

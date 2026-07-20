@@ -133,9 +133,7 @@ class _FakeProcess:
         return self._returncode
 
 
-def _patch_run_async(
-    monkeypatch: pytest.MonkeyPatch, process: _FakeProcess
-) -> None:
+def _patch_run_async(monkeypatch: pytest.MonkeyPatch, process: _FakeProcess) -> None:
     """Make ``ffmpeg.run_async`` return ``process`` without launching ffmpeg."""
 
     def _fake_run_async(*_args: object, **_kwargs: object) -> _FakeProcess:

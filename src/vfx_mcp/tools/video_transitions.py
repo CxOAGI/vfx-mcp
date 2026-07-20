@@ -76,9 +76,7 @@ def _build_stitch_streams(
         if clip_has_audio:
             audio_streams.append(normalize_audio_stream(source.audio))
         else:
-            audio_streams.append(
-                normalize_audio_stream(silent_audio_source(duration))
-            )
+            audio_streams.append(normalize_audio_stream(silent_audio_source(duration)))
 
     video_acc = video_streams[0]
     audio_acc = audio_streams[0]

@@ -397,6 +397,10 @@ class TestFormatConversionE2E:
                     "output_path": str(trimmed_path),
                     "start_time": 1.0,
                     "duration": 3.0,
+                    # Frame-accurate cut so the duration is exactly 3s regardless
+                    # of the runner's ffmpeg keyframe placement (copy-mode trim
+                    # snaps to keyframes and varies across ffmpeg builds).
+                    "accurate": True,
                 },
             )
             assert trimmed_path.exists()
