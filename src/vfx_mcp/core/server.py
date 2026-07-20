@@ -85,12 +85,18 @@ def create_mcp_server() -> FastMCP[None]:
     return mcp
 
 
-def main() -> None:
+def main(server: FastMCP[None] | None = None) -> None:
     """Console entry point for the VFX MCP server.
 
-    Creates the configured server and runs it using the transport selected via
-    environment variables. This is the target of the ``vfx-mcp`` console script
-    declared in ``pyproject.toml``.
+    Runs the configured server using the transport selected via environment
+    variables. This is the target of the ``vfx-mcp`` console script declared in
+    ``pyproject.toml``.
+
+    Args:
+        server: An already-built server to run. When ``None`` (the console
+            script case) a fresh one is created via :func:`create_mcp_server`.
+            ``main.py`` passes its module-level instance so the server is built
+            exactly once instead of a second time here.
 
     Environment Variables:
         MCP_TRANSPORT: Transport protocol to use. One of ``stdio`` (default),
@@ -105,7 +111,8 @@ def main() -> None:
         ValueError: If ``MCP_TRANSPORT`` is not a recognized transport or if
             ``MCP_PORT`` is not a valid integer.
     """
-    server = create_mcp_server()
+    if server is None:
+        server = create_mcp_server()
 
     transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
 

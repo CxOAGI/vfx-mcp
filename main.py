@@ -30,6 +30,7 @@ from vfx_mcp import create_mcp_server, main  # noqa: E402
 # Initialize the MCP server (exposed for testing).
 mcp = create_mcp_server()
 
-# Run the server when called directly, honoring MCP_TRANSPORT/HOST/PORT.
+# Run the server when called directly, honoring MCP_TRANSPORT/HOST/PORT. Reuse
+# the module-level instance built above instead of building a second server.
 if __name__ == "__main__":
-    main()
+    main(mcp)

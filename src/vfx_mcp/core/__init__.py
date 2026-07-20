@@ -1,5 +1,17 @@
 """Core utilities and server components for VFX MCP."""
 
+from .media import (
+    DEFAULT_AUDIO_CODEC,
+    DEFAULT_VIDEO_CODEC,
+    FORMAT_CODECS,
+    TARGET_CHANNEL_LAYOUT,
+    TARGET_SAMPLE_RATE,
+    XFADE_TRANSITION_MAP,
+    even_dimension,
+    normalize_audio_stream,
+    normalize_video_stream,
+    silent_audio_source,
+)
 from .utilities import (
     COLOR_MAP,
     create_standard_output,
@@ -44,4 +56,14 @@ __all__ = [
     "validate_output_path",
     "validate_video_paths",
     "COLOR_MAP",
+    "even_dimension",
+    "normalize_video_stream",
+    "normalize_audio_stream",
+    "silent_audio_source",
+    "TARGET_SAMPLE_RATE",
+    "TARGET_CHANNEL_LAYOUT",
+    "XFADE_TRANSITION_MAP",
+    "FORMAT_CODECS",
+    "DEFAULT_VIDEO_CODEC",
+    "DEFAULT_AUDIO_CODEC",
 ]

@@ -72,6 +72,44 @@ def _decode(raw: bytes | None) -> str:
         return str(raw)
 
 
+def _unlink_quietly(path: str | None) -> None:
+    """Best-effort removal of a (possibly partial) output file.
+
+    Used to clean up the half-written file ffmpeg leaves behind when an encode
+    is killed (timeout / client disconnect) or exits non-zero. Does nothing
+    when ``path`` is ``None`` and swallows :class:`OSError` (missing file,
+    permission issue) so cleanup never masks the original failure or a pending
+    cancellation.
+    """
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _terminate(process: object) -> None:
+    """Kill an ffmpeg subprocess and reap it, ignoring any errors.
+
+    ``process`` is the object returned by :func:`ffmpeg.run_async` (a
+    ``subprocess.Popen``). Both ``kill`` and ``wait`` are guarded so cleanup is
+    safe to run from a timeout handler or a cancellation handler.
+    """
+    kill = getattr(process, "kill", None)
+    if callable(kill):
+        try:
+            kill()
+        except Exception:
+            pass
+    wait = getattr(process, "wait", None)
+    if callable(wait):
+        try:
+            wait()
+        except Exception:
+            pass
+
+
 async def handle_ffmpeg_error(e: ffmpeg.Error, ctx: Context | None = None) -> None:
     """Standard error handling for ffmpeg operations.
 
@@ -93,6 +131,7 @@ async def run_ffmpeg_async(
     *,
     timeout: float | None = None,
     ctx: Context | None = None,
+    output_path: str | None = None,
 ) -> None:
     """Run an ffmpeg output stream without blocking the event loop.
 
@@ -102,6 +141,12 @@ async def run_ffmpeg_async(
     always overwritten and stdout/stderr are captured so that failures can be
     translated through :func:`handle_ffmpeg_error`.
 
+    When the encode does not complete cleanly -- it times out, is cancelled
+    (e.g. the MCP client disconnects mid-encode), or exits non-zero -- ffmpeg
+    typically leaves a truncated, unplayable file behind. If ``output_path`` is
+    supplied, that partial file is removed on any of these paths so callers
+    never observe a corrupt deliverable.
+
     Args:
         output_stream: A configured ffmpeg output node (e.g. from
             :func:`create_standard_output`).
@@ -110,9 +155,17 @@ async def run_ffmpeg_async(
             all when that is unset). On timeout the process is killed and a
             :class:`RuntimeError` is raised.
         ctx: Optional MCP context for error reporting.
+        output_path: Optional path to the file ffmpeg is writing. When given,
+            the partial output is best-effort deleted on timeout, cancellation
+            or non-zero exit. Defaults to ``None`` (no cleanup), keeping the
+            signature backward compatible for callers that do not pass it.
 
     Raises:
         RuntimeError: On ffmpeg failure (non-zero exit) or timeout.
+        asyncio.CancelledError: Re-raised unchanged when the awaiting task is
+            cancelled while the encode is running (after killing the process
+            and cleaning up any partial output). Cancellation is never
+            swallowed.
     """
     effective_timeout = timeout if timeout is not None else _default_timeout()
 
@@ -131,8 +184,8 @@ async def run_ffmpeg_async(
                 timeout=effective_timeout,
             )
         except TimeoutError:
-            process.kill()
-            await asyncio.to_thread(process.wait)
+            await asyncio.to_thread(_terminate, process)
+            _unlink_quietly(output_path)
             error_msg = (
                 f"FFmpeg operation timed out after {effective_timeout} seconds "
                 "and was killed."
@@ -140,9 +193,19 @@ async def run_ffmpeg_async(
             if ctx:
                 await ctx.error(error_msg)
             raise RuntimeError(error_msg) from None
+        except asyncio.CancelledError:
+            # The awaiting task was cancelled (e.g. client disconnect) while the
+            # encode was in flight. Kill and reap the subprocess synchronously
+            # -- re-awaiting during cancellation is fragile and the killed
+            # process reaps almost immediately -- drop the partial file, then
+            # re-raise so cancellation is never swallowed.
+            _terminate(process)
+            _unlink_quietly(output_path)
+            raise
 
         retcode = process.poll()
         if retcode:
+            _unlink_quietly(output_path)
             error = ffmpeg.Error("ffmpeg", stdout, stderr)
             await handle_ffmpeg_error(error, ctx)
 
