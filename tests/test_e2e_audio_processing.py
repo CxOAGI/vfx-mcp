@@ -43,6 +43,28 @@ def _stream_counts(media_path: Path) -> tuple[int, int]:
     return video, audio
 
 
+def _mean_volume_db(media_path: Path, start: float, duration: float) -> float:
+    """Return the mean volume (dBFS) of a time window using ``volumedetect``.
+
+    Runs the ``[start, start + duration)`` slice of ``media_path`` through
+    ffmpeg's ``volumedetect`` filter to the null muxer and parses the
+    ``mean_volume`` line printed to stderr. Silence approaches large negative
+    values (e.g. ``-90 dB``); full-scale audio sits near ``0 dB``.
+    """
+    _, stderr = (
+        ffmpeg.input(str(media_path), ss=start, t=duration)
+        .filter("volumedetect")
+        .output("-", format="null")
+        .run(capture_stdout=True, capture_stderr=True)
+    )
+    for line in stderr.decode().splitlines():
+        if "mean_volume:" in line:
+            # e.g. "[Parsed_volumedetect_0 @ ...] mean_volume: -3.5 dB"
+            value = line.split("mean_volume:")[1].strip().split(" ")[0]
+            return float(value)
+    raise AssertionError(f"volumedetect produced no mean_volume for {media_path}")
+
+
 class TestAudioProcessingE2E:
     """End-to-end tests for audio processing operations."""
 
@@ -405,6 +427,83 @@ class TestAudioProcessingE2E:
                 video_count, audio_count = _stream_counts(output_path)
                 assert video_count == 0
                 assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_audio_fade_out_is_at_the_end(
+        self, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Fade-out must attenuate the END of the clip, not the start.
+
+        Regression test for the bug where ``afade type=out`` was applied with
+        no start time, so ffmpeg defaulted ``st=0`` and the fade happened at
+        the very beginning (leaving the rest silent) instead of at the end.
+
+        The sample audio is a steady 3s tone. After a 1s fade-out the output
+        must: keep its ~3s duration, still be loud near the start, and be much
+        quieter near the end.
+        """
+        async with Client(mcp_server) as client:
+            output_path = temp_dir / "faded_out_placement.wav"
+            _ = await client.call_tool(
+                "audio_fade_out",
+                {
+                    "input_path": str(sample_audio),
+                    "output_path": str(output_path),
+                    "duration": 1.0,
+                },
+            )
+            assert output_path.exists()
+
+            # Duration must be preserved (the fade does not truncate the clip).
+            probe = ffmpeg.probe(str(output_path))
+            duration = float(probe["format"]["duration"])
+            assert 2.8 <= duration <= 3.2, f"unexpected duration {duration}"
+
+            # The start must still carry (near) full-scale audio: if the fade
+            # had wrongly landed at st=0 this window would be heavily attenuated.
+            start_db = _mean_volume_db(output_path, 0.0, 0.5)
+            # The tail (inside the fade region) must be markedly quieter.
+            end_db = _mean_volume_db(output_path, 2.5, 0.5)
+
+            # -40 dB is a generous "not silent" floor: the sine fixture's full
+            # level sits near -21 dB, while faded-out silence drops far below.
+            assert start_db > -40.0, f"start unexpectedly quiet ({start_db} dB)"
+            assert end_db < start_db - 10.0, (
+                f"fade-out did not attenuate the end: start={start_db} dB, "
+                f"end={end_db} dB"
+            )
+
+    @pytest.mark.integration
+    async def test_audio_fade_in_is_at_the_start(
+        self, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Fade-in must attenuate the START of the clip and leave the end loud."""
+        async with Client(mcp_server) as client:
+            output_path = temp_dir / "faded_in_placement.wav"
+            _ = await client.call_tool(
+                "audio_fade_in",
+                {
+                    "input_path": str(sample_audio),
+                    "output_path": str(output_path),
+                    "duration": 1.0,
+                },
+            )
+            assert output_path.exists()
+
+            probe = ffmpeg.probe(str(output_path))
+            duration = float(probe["format"]["duration"])
+            assert 2.8 <= duration <= 3.2, f"unexpected duration {duration}"
+
+            start_db = _mean_volume_db(output_path, 0.0, 0.5)
+            end_db = _mean_volume_db(output_path, 2.5, 0.5)
+
+            # -40 dB is a generous "not silent" floor: the sine fixture's full
+            # level sits near -21 dB, while the faded-in start drops far below.
+            assert end_db > -40.0, f"end unexpectedly quiet ({end_db} dB)"
+            assert start_db < end_db - 10.0, (
+                f"fade-in did not attenuate the start: start={start_db} dB, "
+                f"end={end_db} dB"
+            )
 
     @pytest.mark.integration
     async def test_mix_audio_workflow(

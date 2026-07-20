@@ -33,7 +33,6 @@ from fastmcp import Context, FastMCP
 from ..core import (
     create_standard_output,
     get_video_metadata,
-    handle_ffmpeg_error,
     log_operation,
     run_ffmpeg_async,
     safe_input_path,
@@ -193,90 +192,85 @@ def register_video_effects_tools(
             f"Applying {filter} filter with strength {strength}",
         )
 
-        try:
-            stream: ffmpeg.Stream = ffmpeg.input(resolved_input)
+        stream: ffmpeg.Stream = ffmpeg.input(resolved_input)
 
-            # Apply different filters based on name
-            if filter == "blur":
-                # Apply gaussian blur with strength controlling the blur radius
-                blur_radius = max(0.5, min(strength * 5, 10))  # Scale strength
-                stream = ffmpeg.filter(stream, "gblur", sigma=blur_radius)
-            elif filter == "brightness":
-                stream = ffmpeg.filter(
-                    stream,
-                    "eq",
-                    brightness=strength - 1,
-                )
-            elif filter == "contrast":
-                stream = ffmpeg.filter(
-                    stream,
-                    "eq",
-                    contrast=strength,
-                )
-            elif filter == "saturation":
-                stream = ffmpeg.filter(
-                    stream,
-                    "eq",
-                    saturation=strength,
-                )
-            elif filter == "vintage":
-                # Apply vintage effect using color correction
-                stream = ffmpeg.filter(
-                    stream,
-                    "eq",
-                    brightness=0.1 * strength,
-                    contrast=1.2 * strength,
-                    saturation=0.7 * strength,
-                )
-            elif filter == "sepia":
-                sepia_strength = min(strength, 1.0)
-                stream = ffmpeg.filter(
-                    stream,
-                    "colorchannelmixer",
-                    rr=0.393 * sepia_strength,
-                    rg=0.769 * sepia_strength,
-                    rb=0.189 * sepia_strength,
-                )
-            elif filter == "grayscale":
-                stream = ffmpeg.filter(stream, "hue", s=1 - strength)
-            elif filter == "hflip":
-                stream = ffmpeg.filter(stream, "hflip")
-            elif filter == "sharpen":
-                # Apply unsharp mask for sharpening with strength controlling amount
-                sharpen_amount = max(0.1, min(strength, 3.0))  # Scale strength
-                stream = ffmpeg.filter(
-                    stream,
-                    "unsharp",
-                    luma_msize_x=5,
-                    luma_msize_y=5,
-                    luma_amount=sharpen_amount,
-                )
-            elif filter.startswith("scale="):
-                # Handle scale filter with parameters like scale=640:360.
-                # Force even dimensions so libx264/yuv420p does not reject odd
-                # width/height; an axis of -1 (auto) becomes -2 (auto + even).
-                scale_params = filter.split("=")[1]
-                width, height = scale_params.split(":")
-                stream = ffmpeg.filter(
-                    stream,
-                    "scale",
-                    str(_force_even(int(width))),
-                    str(_force_even(int(height))),
-                )
-
-            output: ffmpeg.Stream = create_standard_output(
+        # Apply different filters based on name
+        if filter == "blur":
+            # Apply gaussian blur with strength controlling the blur radius
+            blur_radius = max(0.5, min(strength * 5, 10))  # Scale strength
+            stream = ffmpeg.filter(stream, "gblur", sigma=blur_radius)
+        elif filter == "brightness":
+            stream = ffmpeg.filter(
                 stream,
-                resolved_output,
-                crf=crf,
-                preset=preset,
-                map="0:a?",
+                "eq",
+                brightness=strength - 1,
             )
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"{filter.title()} filter applied and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            # handle_ffmpeg_error raises, but we need a return for type checking
-            raise
+        elif filter == "contrast":
+            stream = ffmpeg.filter(
+                stream,
+                "eq",
+                contrast=strength,
+            )
+        elif filter == "saturation":
+            stream = ffmpeg.filter(
+                stream,
+                "eq",
+                saturation=strength,
+            )
+        elif filter == "vintage":
+            # Apply vintage effect using color correction
+            stream = ffmpeg.filter(
+                stream,
+                "eq",
+                brightness=0.1 * strength,
+                contrast=1.2 * strength,
+                saturation=0.7 * strength,
+            )
+        elif filter == "sepia":
+            sepia_strength = min(strength, 1.0)
+            stream = ffmpeg.filter(
+                stream,
+                "colorchannelmixer",
+                rr=0.393 * sepia_strength,
+                rg=0.769 * sepia_strength,
+                rb=0.189 * sepia_strength,
+            )
+        elif filter == "grayscale":
+            stream = ffmpeg.filter(stream, "hue", s=1 - strength)
+        elif filter == "hflip":
+            stream = ffmpeg.filter(stream, "hflip")
+        elif filter == "sharpen":
+            # Apply unsharp mask for sharpening with strength controlling amount
+            sharpen_amount = max(0.1, min(strength, 3.0))  # Scale strength
+            stream = ffmpeg.filter(
+                stream,
+                "unsharp",
+                luma_msize_x=5,
+                luma_msize_y=5,
+                luma_amount=sharpen_amount,
+            )
+        elif filter.startswith("scale="):
+            # Handle scale filter with parameters like scale=640:360.
+            # Force even dimensions so libx264/yuv420p does not reject odd
+            # width/height; an axis of -1 (auto) becomes -2 (auto + even).
+            scale_params = filter.split("=")[1]
+            width, height = scale_params.split(":")
+            stream = ffmpeg.filter(
+                stream,
+                "scale",
+                str(_force_even(int(width))),
+                str(_force_even(int(height))),
+            )
+
+        output: ffmpeg.Stream = create_standard_output(
+            stream,
+            resolved_output,
+            crf=crf,
+            preset=preset,
+            map="0:a?",
+        )
+        await run_ffmpeg_async(output, ctx=ctx, output_path=resolved_output)
+        return f"{filter.title()} filter applied and saved to {output_path}"
 
     @mcp.tool
     async def change_speed(
@@ -351,64 +345,59 @@ def register_video_effects_tools(
             + ("" if has_audio else " (silent input, video only)"),
         )
 
-        try:
-            stream: ffmpeg.Stream = ffmpeg.input(resolved_input)
+        stream: ffmpeg.Stream = ffmpeg.input(resolved_input)
 
-            # Apply speed change to the video by scaling presentation timestamps.
-            video_stream: ffmpeg.Stream = ffmpeg.filter(
-                stream["v"],
-                "setpts",
-                f"PTS/{speed}",
+        # Apply speed change to the video by scaling presentation timestamps.
+        video_stream: ffmpeg.Stream = ffmpeg.filter(
+            stream["v"],
+            "setpts",
+            f"PTS/{speed}",
+        )
+
+        if not has_audio:
+            # No audio stream: write video only, skipping atempo entirely.
+            output: ffmpeg.Stream = create_standard_output(
+                video_stream,
+                resolved_output,
+                crf=crf,
+                preset=preset,
             )
+        else:
+            # Handle atempo filter limitations (0.5-2.0 range). For speeds
+            # outside this range, chain multiple atempo filters.
+            audio_stream: ffmpeg.Stream = stream["a"]
+            current_speed = speed
 
-            if not has_audio:
-                # No audio stream: write video only, skipping atempo entirely.
-                output: ffmpeg.Stream = create_standard_output(
-                    video_stream,
-                    resolved_output,
-                    crf=crf,
-                    preset=preset,
-                )
-            else:
-                # Handle atempo filter limitations (0.5-2.0 range). For speeds
-                # outside this range, chain multiple atempo filters.
-                audio_stream: ffmpeg.Stream = stream["a"]
-                current_speed = speed
+            while current_speed > 2.0:
+                audio_stream = ffmpeg.filter(audio_stream, "atempo", "2.0")
+                current_speed /= 2.0
 
-                while current_speed > 2.0:
-                    audio_stream = ffmpeg.filter(audio_stream, "atempo", "2.0")
-                    current_speed /= 2.0
+            while current_speed < 0.5:
+                audio_stream = ffmpeg.filter(audio_stream, "atempo", "0.5")
+                current_speed /= 0.5
 
-                while current_speed < 0.5:
-                    audio_stream = ffmpeg.filter(audio_stream, "atempo", "0.5")
-                    current_speed /= 0.5
-
-                if current_speed != 1.0:
-                    audio_stream = ffmpeg.filter(
-                        audio_stream, "atempo", str(current_speed)
-                    )
-
-                # Both video and audio are re-encoded. create_standard_output
-                # only maps a single stream, so build the two-stream output
-                # directly using the same encoding settings/quality controls.
-                output = ffmpeg.output(
-                    video_stream,
-                    audio_stream,
-                    resolved_output,
-                    **_speed_output_settings(crf, preset),
+            if current_speed != 1.0:
+                audio_stream = ffmpeg.filter(
+                    audio_stream, "atempo", str(current_speed)
                 )
 
-            await run_ffmpeg_async(output, ctx=ctx)
-
-            speed_desc = "faster" if speed > 1.0 else "slower"
-            return (
-                f"Video speed changed {speed_desc} ({speed}x) and saved to "
-                f"{output_path}"
+            # Both video and audio are re-encoded. create_standard_output
+            # only maps a single stream, so build the two-stream output
+            # directly using the same encoding settings/quality controls.
+            output = ffmpeg.output(
+                video_stream,
+                audio_stream,
+                resolved_output,
+                **_speed_output_settings(crf, preset),
             )
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            # handle_ffmpeg_error raises, but we need a return for type checking
-            raise
+
+        await run_ffmpeg_async(output, ctx=ctx, output_path=resolved_output)
+
+        speed_desc = "faster" if speed > 1.0 else "slower"
+        return (
+            f"Video speed changed {speed_desc} ({speed}x) and saved to "
+            f"{output_path}"
+        )
 
     @mcp.tool
     async def generate_thumbnail(
@@ -459,26 +448,21 @@ def register_video_effects_tools(
             f"Generating {size_desc} thumbnail at {timestamp}s",
         )
 
-        try:
-            stream: ffmpeg.Stream = ffmpeg.input(resolved_input, ss=timestamp)
+        stream: ffmpeg.Stream = ffmpeg.input(resolved_input, ss=timestamp)
 
-            # Only apply scaling if dimensions are specified
-            if width is not None or height is not None:
-                # Use -2 for the auto axis so ffmpeg preserves aspect ratio and
-                # yields an even dimension when only one axis is specified.
-                scale_width = width if width is not None else -2
-                scale_height = height if height is not None else -2
-                stream = ffmpeg.filter(
-                    stream, "scale", str(scale_width), str(scale_height)
-                )
+        # Only apply scaling if dimensions are specified
+        if width is not None or height is not None:
+            # Use -2 for the auto axis so ffmpeg preserves aspect ratio and
+            # yields an even dimension when only one axis is specified.
+            scale_width = width if width is not None else -2
+            scale_height = height if height is not None else -2
+            stream = ffmpeg.filter(
+                stream, "scale", str(scale_width), str(scale_height)
+            )
 
-            output: ffmpeg.Stream = ffmpeg.output(stream, resolved_output, vframes=1)
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Thumbnail generated and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            # handle_ffmpeg_error raises, but we need a return for type checking
-            raise
+        output: ffmpeg.Stream = ffmpeg.output(stream, resolved_output, vframes=1)
+        await run_ffmpeg_async(output, ctx=ctx, output_path=resolved_output)
+        return f"Thumbnail generated and saved to {output_path}"
 
     # Mark decorated functions as used (they're accessed via the @mcp.tool decorator)
     _ = (apply_filter, change_speed, generate_thumbnail)

@@ -39,7 +39,7 @@ import ffmpeg
 from fastmcp import Context, FastMCP
 
 from ..core import (
-    handle_ffmpeg_error,
+    get_video_metadata,
     log_operation,
     run_ffmpeg_async,
     safe_input_path,
@@ -157,61 +157,57 @@ def register_audio_tools(mcp: FastMCP[Any]) -> None:
             f"Extracting audio as {format} at {bitrate}",
         )
 
-        try:
-            stream: Any = ffmpeg.input(safe_in)
+        stream: Any = ffmpeg.input(safe_in)
 
-            # Extract only the audio stream
-            audio_stream: Any = stream["a"]
+        # Extract only the audio stream
+        audio_stream: Any = stream["a"]
 
-            if format == "wav":
-                output: Any = ffmpeg.output(
-                    audio_stream,
-                    safe_out,
-                    acodec="pcm_s16le",
-                )
-            else:
-                codec_map = {
-                    "mp3": "libmp3lame",
-                    "aac": "aac",
-                    "flac": "flac",
-                    "ogg": "libvorbis",
-                }
+        if format == "wav":
+            output: Any = ffmpeg.output(
+                audio_stream,
+                safe_out,
+                acodec="pcm_s16le",
+            )
+        else:
+            codec_map = {
+                "mp3": "libmp3lame",
+                "aac": "aac",
+                "flac": "flac",
+                "ogg": "libvorbis",
+            }
 
-                output_kwargs: dict[str, Any] = {
-                    "acodec": codec_map[format],
-                }
+            output_kwargs: dict[str, Any] = {
+                "acodec": codec_map[format],
+            }
 
-                # Handle bitrate differently for different formats
-                if format == "ogg":
-                    # libvorbis uses quality-based encoding (VBR) by default
-                    # Use -q:a instead of bitrate for better compatibility
-                    if bitrate:
-                        # Convert bitrate to approximate quality level
-                        bitrate_num = int(bitrate.rstrip("k"))
-                        if bitrate_num <= 96:
-                            output_kwargs["qscale:a"] = "0"  # ~64kbps
-                        elif bitrate_num <= 128:
-                            output_kwargs["qscale:a"] = "2"  # ~96kbps
-                        elif bitrate_num <= 192:
-                            output_kwargs["qscale:a"] = "4"  # ~128kbps
-                        elif bitrate_num <= 256:
-                            output_kwargs["qscale:a"] = "6"  # ~192kbps
-                        else:
-                            output_kwargs["qscale:a"] = "8"  # ~256kbps+
-                elif format not in ["flac"] and bitrate:
-                    output_kwargs["audio_bitrate"] = bitrate
+            # Handle bitrate differently for different formats
+            if format == "ogg":
+                # libvorbis uses quality-based encoding (VBR) by default
+                # Use -q:a instead of bitrate for better compatibility
+                if bitrate:
+                    # Convert bitrate to approximate quality level
+                    bitrate_num = int(bitrate.rstrip("k"))
+                    if bitrate_num <= 96:
+                        output_kwargs["qscale:a"] = "0"  # ~64kbps
+                    elif bitrate_num <= 128:
+                        output_kwargs["qscale:a"] = "2"  # ~96kbps
+                    elif bitrate_num <= 192:
+                        output_kwargs["qscale:a"] = "4"  # ~128kbps
+                    elif bitrate_num <= 256:
+                        output_kwargs["qscale:a"] = "6"  # ~192kbps
+                    else:
+                        output_kwargs["qscale:a"] = "8"  # ~256kbps+
+            elif format not in ["flac"] and bitrate:
+                output_kwargs["audio_bitrate"] = bitrate
 
-                output = ffmpeg.output(
-                    audio_stream,
-                    safe_out,
-                    **output_kwargs,
-                )
+            output = ffmpeg.output(
+                audio_stream,
+                safe_out,
+                **output_kwargs,
+            )
 
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Audio extracted successfully and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise  # Re-raise to ensure function returns on all paths
+        await run_ffmpeg_async(output, ctx=ctx, output_path=safe_out)
+        return f"Audio extracted successfully and saved to {output_path}"
 
     @mcp.tool
     async def add_audio(
@@ -275,49 +271,45 @@ def register_audio_tools(mcp: FastMCP[Any]) -> None:
             f"Adding audio to video (mode: {mode}, volume: {audio_volume})",
         )
 
-        try:
-            video_input: Any = ffmpeg.input(safe_in)
-            audio_input: Any = ffmpeg.input(safe_audio)
+        video_input: Any = ffmpeg.input(safe_in)
+        audio_input: Any = ffmpeg.input(safe_audio)
 
-            new_audio: Any = audio_input.audio
-            if audio_volume != 1.0:
-                new_audio = ffmpeg.filter(new_audio, "volume", audio_volume)
+        new_audio: Any = audio_input.audio
+        if audio_volume != 1.0:
+            new_audio = ffmpeg.filter(new_audio, "volume", audio_volume)
 
-            if effective_replace:
-                # Video from input (stream-copied), audio ONLY from the new
-                # file: -map 0:v -map 1:a. The original audio is dropped, so
-                # the output has a single audio track.
-                output: Any = ffmpeg.output(
-                    video_input.video,
-                    new_audio,
-                    safe_out,
-                    vcodec="copy",
-                    acodec="aac",
-                    shortest=None,
-                )
-            else:  # mix
-                # Mix the video's original audio with the new audio. normalize=0
-                # sums the inputs at full level instead of halving them.
-                mixed_audio: Any = ffmpeg.filter(
-                    [video_input.audio, new_audio],
-                    "amix",
-                    inputs=2,
-                    duration="shortest",
-                    normalize=0,
-                )
-                output = ffmpeg.output(
-                    video_input.video,
-                    mixed_audio,
-                    safe_out,
-                    vcodec="copy",
-                    acodec="aac",
-                )
+        if effective_replace:
+            # Video from input (stream-copied), audio ONLY from the new
+            # file: -map 0:v -map 1:a. The original audio is dropped, so
+            # the output has a single audio track.
+            output: Any = ffmpeg.output(
+                video_input.video,
+                new_audio,
+                safe_out,
+                vcodec="copy",
+                acodec="aac",
+                shortest=None,
+            )
+        else:  # mix
+            # Mix the video's original audio with the new audio. normalize=0
+            # sums the inputs at full level instead of halving them.
+            mixed_audio: Any = ffmpeg.filter(
+                [video_input.audio, new_audio],
+                "amix",
+                inputs=2,
+                duration="shortest",
+                normalize=0,
+            )
+            output = ffmpeg.output(
+                video_input.video,
+                mixed_audio,
+                safe_out,
+                vcodec="copy",
+                acodec="aac",
+            )
 
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Audio {mode}d successfully and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise  # Re-raise to ensure function returns on all paths
+        await run_ffmpeg_async(output, ctx=ctx, output_path=safe_out)
+        return f"Audio {mode}d successfully and saved to {output_path}"
 
     @mcp.tool
     async def adjust_audio_volume(
@@ -362,27 +354,23 @@ def register_audio_tools(mcp: FastMCP[Any]) -> None:
             f"Adjusting audio volume to {volume}x",
         )
 
-        try:
-            stream: Any = ffmpeg.input(safe_in)
-            audio: Any = ffmpeg.filter(stream.audio, "volume", volume)
+        stream: Any = ffmpeg.input(safe_in)
+        audio: Any = ffmpeg.filter(stream.audio, "volume", volume)
 
-            if has_video:
-                # Preserve the video stream (copy) alongside the filtered audio.
-                output: Any = ffmpeg.output(
-                    stream.video,
-                    audio,
-                    safe_out,
-                    vcodec="copy",
-                    acodec="aac",
-                )
-            else:
-                output = ffmpeg.output(audio, safe_out)
+        if has_video:
+            # Preserve the video stream (copy) alongside the filtered audio.
+            output: Any = ffmpeg.output(
+                stream.video,
+                audio,
+                safe_out,
+                vcodec="copy",
+                acodec="aac",
+            )
+        else:
+            output = ffmpeg.output(audio, safe_out)
 
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Audio volume adjusted to {volume}x and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise  # Re-raise to ensure function returns on all paths
+        await run_ffmpeg_async(output, ctx=ctx, output_path=safe_out)
+        return f"Audio volume adjusted to {volume}x and saved to {output_path}"
 
     @mcp.tool
     async def mix_audio(
@@ -428,30 +416,26 @@ def register_audio_tools(mcp: FastMCP[Any]) -> None:
             f"Mixing audio files (vol1: {audio1_volume}, vol2: {audio2_volume})",
         )
 
-        try:
-            audio1: Any = ffmpeg.input(safe_in1)
-            audio2: Any = ffmpeg.input(safe_in2)
+        audio1: Any = ffmpeg.input(safe_in1)
+        audio2: Any = ffmpeg.input(safe_in2)
 
-            # Apply volume adjustments if needed
-            if audio1_volume != 1.0:
-                audio1 = ffmpeg.filter(audio1, "volume", audio1_volume)
-            if audio2_volume != 1.0:
-                audio2 = ffmpeg.filter(audio2, "volume", audio2_volume)
+        # Apply volume adjustments if needed
+        if audio1_volume != 1.0:
+            audio1 = ffmpeg.filter(audio1, "volume", audio1_volume)
+        if audio2_volume != 1.0:
+            audio2 = ffmpeg.filter(audio2, "volume", audio2_volume)
 
-            # Mix the audio tracks. normalize=0 preserves the summed level.
-            mixed_audio: Any = ffmpeg.filter(
-                [audio1, audio2],
-                "amix",
-                inputs=2,
-                duration="longest",
-                normalize=0,
-            )
-            output: Any = ffmpeg.output(mixed_audio, safe_out)
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Audio files mixed successfully and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise  # Re-raise to ensure function returns on all paths
+        # Mix the audio tracks. normalize=0 preserves the summed level.
+        mixed_audio: Any = ffmpeg.filter(
+            [audio1, audio2],
+            "amix",
+            inputs=2,
+            duration="longest",
+            normalize=0,
+        )
+        output: Any = ffmpeg.output(mixed_audio, safe_out)
+        await run_ffmpeg_async(output, ctx=ctx, output_path=safe_out)
+        return f"Audio files mixed successfully and saved to {output_path}"
 
     @mcp.tool
     async def audio_fade_in(
@@ -496,28 +480,25 @@ def register_audio_tools(mcp: FastMCP[Any]) -> None:
             f"Applying {duration}s fade-in effect",
         )
 
-        try:
-            stream: Any = ffmpeg.input(safe_in)
-            audio: Any = ffmpeg.filter(
-                stream.audio, "afade", type="in", duration=duration
+        stream: Any = ffmpeg.input(safe_in)
+        # Fade-in always starts at the beginning of the clip (st defaults to 0).
+        audio: Any = ffmpeg.filter(
+            stream.audio, "afade", type="in", duration=duration
+        )
+
+        if has_video:
+            output: Any = ffmpeg.output(
+                stream.video,
+                audio,
+                safe_out,
+                vcodec="copy",
+                acodec="aac",
             )
+        else:
+            output = ffmpeg.output(audio, safe_out)
 
-            if has_video:
-                output: Any = ffmpeg.output(
-                    stream.video,
-                    audio,
-                    safe_out,
-                    vcodec="copy",
-                    acodec="aac",
-                )
-            else:
-                output = ffmpeg.output(audio, safe_out)
-
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Fade-in effect applied ({duration}s) and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise  # Re-raise to ensure function returns on all paths
+        await run_ffmpeg_async(output, ctx=ctx, output_path=safe_out)
+        return f"Fade-in effect applied ({duration}s) and saved to {output_path}"
 
     @mcp.tool
     async def audio_fade_out(
@@ -556,33 +537,41 @@ def register_audio_tools(mcp: FastMCP[Any]) -> None:
         if not has_audio:
             raise ValueError(f"Input has no audio stream to fade: {input_path}")
 
+        # A fade-OUT must land at the END of the clip. ``afade`` defaults its
+        # start time (``st``) to 0, which would fade in reverse at the very
+        # start and leave the tail silent, so we probe the total duration and
+        # start the fade ``duration`` seconds before the end (clamped to 0 for
+        # clips shorter than the requested fade).
+        total_duration = get_video_metadata(safe_in)["duration"]
+        start_time = max(total_duration - duration, 0.0)
+
         await log_operation(
             ctx,
-            f"Applying {duration}s fade-out effect",
+            f"Applying {duration}s fade-out effect (starting at {start_time}s)",
         )
 
-        try:
-            stream: Any = ffmpeg.input(safe_in)
-            audio: Any = ffmpeg.filter(
-                stream.audio, "afade", type="out", duration=duration
+        stream: Any = ffmpeg.input(safe_in)
+        audio: Any = ffmpeg.filter(
+            stream.audio,
+            "afade",
+            type="out",
+            start_time=start_time,
+            duration=duration,
+        )
+
+        if has_video:
+            output: Any = ffmpeg.output(
+                stream.video,
+                audio,
+                safe_out,
+                vcodec="copy",
+                acodec="aac",
             )
+        else:
+            output = ffmpeg.output(audio, safe_out)
 
-            if has_video:
-                output: Any = ffmpeg.output(
-                    stream.video,
-                    audio,
-                    safe_out,
-                    vcodec="copy",
-                    acodec="aac",
-                )
-            else:
-                output = ffmpeg.output(audio, safe_out)
-
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Fade-out effect applied ({duration}s) and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise  # Re-raise to ensure function returns on all paths
+        await run_ffmpeg_async(output, ctx=ctx, output_path=safe_out)
+        return f"Fade-out effect applied ({duration}s) and saved to {output_path}"
 
     @mcp.tool
     async def normalize_loudness(
@@ -639,29 +628,25 @@ def register_audio_tools(mcp: FastMCP[Any]) -> None:
             f"LRA {target_lra} LU)",
         )
 
-        try:
-            stream: Any = ffmpeg.input(safe_in)
-            audio: Any = ffmpeg.filter(
-                stream.audio,
-                "loudnorm",
-                i=target_i,
-                tp=target_tp,
-                lra=target_lra,
+        stream: Any = ffmpeg.input(safe_in)
+        audio: Any = ffmpeg.filter(
+            stream.audio,
+            "loudnorm",
+            i=target_i,
+            tp=target_tp,
+            lra=target_lra,
+        )
+
+        if has_video:
+            output: Any = ffmpeg.output(
+                stream.video,
+                audio,
+                safe_out,
+                vcodec="copy",
+                acodec="aac",
             )
+        else:
+            output = ffmpeg.output(audio, safe_out)
 
-            if has_video:
-                output: Any = ffmpeg.output(
-                    stream.video,
-                    audio,
-                    safe_out,
-                    vcodec="copy",
-                    acodec="aac",
-                )
-            else:
-                output = ffmpeg.output(audio, safe_out)
-
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Loudness normalized to {target_i} LUFS and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise  # Re-raise to ensure function returns on all paths
+        await run_ffmpeg_async(output, ctx=ctx, output_path=safe_out)
+        return f"Loudness normalized to {target_i} LUFS and saved to {output_path}"

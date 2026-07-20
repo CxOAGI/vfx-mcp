@@ -19,94 +19,18 @@ import ffmpeg
 from fastmcp import Context, FastMCP
 
 from ..core import (
+    XFADE_TRANSITION_MAP,
+    even_dimension,
     get_video_metadata,
-    handle_ffmpeg_error,
     log_operation,
+    normalize_audio_stream,
+    normalize_video_stream,
     run_ffmpeg_async,
     safe_input_path,
     safe_output_path,
+    silent_audio_source,
     validate_transition_type,
 )
-
-# Map the review's transition vocabulary (as accepted/normalized by
-# ``validate_transition_type``) onto the transition names understood by
-# FFmpeg's ``xfade`` filter. ``crossfade`` is an alias for a plain fade.
-_XFADE_TRANSITION_MAP: dict[str, str] = {
-    "fade": "fade",
-    "crossfade": "fade",
-    "dissolve": "dissolve",
-    "wipe_left": "wipeleft",
-    "wipe_right": "wiperight",
-    "wipe_up": "wipeup",
-    "wipe_down": "wipedown",
-    "slide_left": "slideleft",
-    "slide_right": "slideright",
-}
-
-# Canonical audio format used for the ``acrossfade`` chain so that clips with
-# differing sample rates / channel layouts (and injected silence) mix cleanly.
-_TARGET_SAMPLE_RATE = 44100
-_TARGET_CHANNEL_LAYOUT = "stereo"
-
-
-def _even(value: int) -> int:
-    """Round ``value`` up to the nearest even integer (libx264/yuv420p safe)."""
-    value = max(value, 2)
-    return value if value % 2 == 0 else value + 1
-
-
-def _normalize_video(
-    stream: ffmpeg.Stream,
-    *,
-    width: int,
-    height: int,
-    fps: int,
-) -> ffmpeg.Stream:
-    """Scale/pad a video stream to a canonical geometry, fps, SAR and pix_fmt.
-
-    ``xfade`` requires both of its inputs to share identical resolution, pixel
-    format and frame rate, so every clip is conformed to the same target before
-    the transition graph is assembled. Aspect ratio is preserved by scaling to
-    fit and letterbox/pillarbox padding the remainder.
-    """
-    stream = ffmpeg.filter(
-        stream,
-        "scale",
-        width,
-        height,
-        force_original_aspect_ratio="decrease",
-    )
-    stream = ffmpeg.filter(
-        stream,
-        "pad",
-        width,
-        height,
-        "(ow-iw)/2",
-        "(oh-ih)/2",
-    )
-    stream = ffmpeg.filter(stream, "setsar", "1")
-    stream = ffmpeg.filter(stream, "fps", fps)
-    return ffmpeg.filter(stream, "format", "yuv420p")
-
-
-def _normalize_audio(stream: ffmpeg.Stream) -> ffmpeg.Stream:
-    """Conform an audio stream to the canonical sample rate/channel layout."""
-    return ffmpeg.filter(
-        stream,
-        "aformat",
-        sample_rates=_TARGET_SAMPLE_RATE,
-        channel_layouts=_TARGET_CHANNEL_LAYOUT,
-    )
-
-
-def _silent_audio(duration: float) -> ffmpeg.Stream:
-    """Create a bounded silent audio source for a clip with no audio track."""
-    return ffmpeg.input(
-        f"anullsrc=channel_layout={_TARGET_CHANNEL_LAYOUT}"
-        f":sample_rate={_TARGET_SAMPLE_RATE}",
-        f="lavfi",
-        t=duration,
-    )
 
 
 def _build_stitch_streams(
@@ -142,7 +66,7 @@ def _build_stitch_streams(
     ):
         source = ffmpeg.input(path)
         video_streams.append(
-            _normalize_video(
+            normalize_video_stream(
                 source.video,
                 width=target_width,
                 height=target_height,
@@ -150,9 +74,11 @@ def _build_stitch_streams(
             )
         )
         if clip_has_audio:
-            audio_streams.append(_normalize_audio(source.audio))
+            audio_streams.append(normalize_audio_stream(source.audio))
         else:
-            audio_streams.append(_normalize_audio(_silent_audio(duration)))
+            audio_streams.append(
+                normalize_audio_stream(silent_audio_source(duration))
+            )
 
     video_acc = video_streams[0]
     audio_acc = audio_streams[0]
@@ -243,7 +169,7 @@ def register_transition_tools(
 
         # Validate against the review vocabulary, then map to the xfade name.
         validated = validate_transition_type(transition)
-        xfade_name = _XFADE_TRANSITION_MAP[validated]
+        xfade_name = XFADE_TRANSITION_MAP[validated]
 
         resolved_inputs = [safe_input_path(path) for path in input_paths]
         resolved_output = safe_output_path(output_path)
@@ -281,53 +207,49 @@ def register_transition_tools(
             target_height = max(target_height, video_meta["height"])
             target_fps = max(target_fps, video_meta["fps"])
 
-        target_width = _even(target_width)
-        target_height = _even(target_height)
+        target_width = even_dimension(target_width)
+        target_height = even_dimension(target_height)
         # Fall back to 30fps if probing could not determine a frame rate.
         fps = round(target_fps) if target_fps > 0 else 30
 
-        try:
-            video_stream, audio_stream = _build_stitch_streams(
-                [str(path) for path in resolved_inputs],
-                durations,
-                has_audio,
-                target_width=target_width,
-                target_height=target_height,
-                target_fps=fps,
-                xfade_name=xfade_name,
-                transition_duration=duration,
-            )
+        video_stream, audio_stream = _build_stitch_streams(
+            [str(path) for path in resolved_inputs],
+            durations,
+            has_audio,
+            target_width=target_width,
+            target_height=target_height,
+            target_fps=fps,
+            xfade_name=xfade_name,
+            transition_duration=duration,
+        )
 
-            # ``create_standard_output`` only supports a single output stream;
-            # here we must mux the separate xfade video and acrossfade audio
-            # streams, so build the output directly while mirroring its
-            # standard libx264/yuv420p/aac settings and quality controls.
-            output_kwargs: dict[str, str | int | float] = {
-                "vcodec": "libx264",
-                "pix_fmt": "yuv420p",
-                "acodec": "aac",
-            }
-            if crf is not None:
-                output_kwargs["crf"] = crf
-            if preset is not None:
-                output_kwargs["preset"] = preset
-            if faststart:
-                output_kwargs["movflags"] = "+faststart"
+        # ``create_standard_output`` only supports a single output stream;
+        # here we must mux the separate xfade video and acrossfade audio
+        # streams, so build the output directly while mirroring its
+        # standard libx264/yuv420p/aac settings and quality controls.
+        output_kwargs: dict[str, str | int | float] = {
+            "vcodec": "libx264",
+            "pix_fmt": "yuv420p",
+            "acodec": "aac",
+        }
+        if crf is not None:
+            output_kwargs["crf"] = crf
+        if preset is not None:
+            output_kwargs["preset"] = preset
+        if faststart:
+            output_kwargs["movflags"] = "+faststart"
 
-            output = ffmpeg.output(
-                video_stream,
-                audio_stream,
-                str(resolved_output),
-                **output_kwargs,
-            )
-            await run_ffmpeg_async(output, ctx=ctx)
-            return (
-                f"Stitched {len(resolved_inputs)} clips with '{validated}' "
-                f"transitions and saved to {output_path}"
-            )
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise
+        output = ffmpeg.output(
+            video_stream,
+            audio_stream,
+            str(resolved_output),
+            **output_kwargs,
+        )
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
+        return (
+            f"Stitched {len(resolved_inputs)} clips with '{validated}' "
+            f"transitions and saved to {output_path}"
+        )
 
     # Ensure the function is registered with MCP.
     del stitch_with_transitions

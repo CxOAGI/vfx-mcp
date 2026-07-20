@@ -21,21 +21,18 @@ from fastmcp import Context, FastMCP
 
 from ..core import (
     create_standard_output,
+    even_dimension,
     get_video_metadata,
-    handle_ffmpeg_error,
     log_operation,
+    normalize_audio_stream,
+    normalize_video_stream,
     run_ffmpeg_async,
     safe_input_path,
     safe_output_path,
+    silent_audio_source,
     validate_range,
 )
 from ..core.utilities import VideoMetadata
-
-# Audio normalization targets used when re-encoding heterogeneous inputs so
-# every segment's audio shares one sample rate / channel layout before the
-# ffmpeg ``concat`` filter joins them.
-_TARGET_SAMPLE_RATE = "44100"
-_TARGET_CHANNEL_LAYOUT = "stereo"
 
 # Fallback geometry used only when no input could be probed for dimensions.
 _FALLBACK_WIDTH = 1280
@@ -45,12 +42,6 @@ _FALLBACK_FPS = 30.0
 # Containers for which ``-movflags +faststart`` is meaningful (relocates the
 # moov atom for progressive playback). Applying it to other containers errors.
 _FASTSTART_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".m4a"})
-
-
-def _even(value: int) -> int:
-    """Round ``value`` down to the nearest even integer (>= 2)."""
-    even = value - (value % 2)
-    return even if even >= 2 else 2
 
 
 def _wants_faststart(output_path: Path) -> bool:
@@ -113,42 +104,10 @@ def _target_geometry(metas: list[VideoMetadata]) -> tuple[int, int, float]:
     heights = [m["video"]["height"] for m in metas if "video" in m]
     rates = [m["video"]["fps"] for m in metas if "video" in m and m["video"]["fps"] > 0]
 
-    width = _even(max(widths)) if widths else _FALLBACK_WIDTH
-    height = _even(max(heights)) if heights else _FALLBACK_HEIGHT
+    width = even_dimension(max(widths)) if widths else _FALLBACK_WIDTH
+    height = even_dimension(max(heights)) if heights else _FALLBACK_HEIGHT
     fps = max(rates) if rates else _FALLBACK_FPS
     return width, height, fps
-
-
-def _normalize_video(stream: Any, width: int, height: int, fps: float) -> Any:
-    """Scale/pad to a common canvas and force fps, SAR and pixel format."""
-    stream = ffmpeg.filter(
-        stream,
-        "scale",
-        width,
-        height,
-        force_original_aspect_ratio="decrease",
-    )
-    stream = ffmpeg.filter(
-        stream,
-        "pad",
-        width,
-        height,
-        "(ow-iw)/2",
-        "(oh-ih)/2",
-    )
-    stream = ffmpeg.filter(stream, "setsar", "1")
-    stream = ffmpeg.filter(stream, "fps", fps=fps)
-    return ffmpeg.filter(stream, "format", "yuv420p")
-
-
-def _normalize_audio(stream: Any) -> Any:
-    """Force a common sample rate and channel layout for concat alignment."""
-    return ffmpeg.filter(
-        stream,
-        "aformat",
-        sample_rates=_TARGET_SAMPLE_RATE,
-        channel_layouts=_TARGET_CHANNEL_LAYOUT,
-    )
 
 
 def _write_concat_list(inputs: list[Path]) -> str:
@@ -249,34 +208,30 @@ def register_basic_video_tools(
             + f" [{mode}]",
         )
 
-        try:
-            stream = ffmpeg.input(str(resolved_input), ss=start_time)
-            extra: dict[str, float] = {}
-            if duration is not None:
-                extra["t"] = duration
+        stream = ffmpeg.input(str(resolved_input), ss=start_time)
+        extra: dict[str, float] = {}
+        if duration is not None:
+            extra["t"] = duration
 
-            if accurate:
-                output = create_standard_output(
-                    stream,
-                    str(resolved_output),
-                    crf=crf,
-                    preset=preset,
-                    faststart=_wants_faststart(resolved_output),
-                    **extra,
-                )
-            else:
-                output = ffmpeg.output(
-                    stream,
-                    str(resolved_output),
-                    c="copy",
-                    **extra,
-                )
+        if accurate:
+            output = create_standard_output(
+                stream,
+                str(resolved_output),
+                crf=crf,
+                preset=preset,
+                faststart=_wants_faststart(resolved_output),
+                **extra,
+            )
+        else:
+            output = ffmpeg.output(
+                stream,
+                str(resolved_output),
+                c="copy",
+                **extra,
+            )
 
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Video trimmed successfully and saved to {resolved_output}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
+        return f"Video trimmed successfully and saved to {resolved_output}"
 
     # Ensure function is registered with MCP
     del trim_video
@@ -354,57 +309,55 @@ def register_basic_video_tools(
         resolved_input = safe_input_path(input_path)
         resolved_output = safe_output_path(output_path)
 
-        try:
-            stream = ffmpeg.input(str(resolved_input))
+        stream = ffmpeg.input(str(resolved_input))
 
-            if scale is not None:
-                validate_range(
-                    scale,
-                    0.1,
-                    10.0,
-                    "Scale factor",
-                )
-                # trunc(...*/2)*2 forces an even result on both axes.
-                stream = ffmpeg.filter(
-                    stream,
-                    "scale",
-                    f"trunc(iw*{scale}/2)*2",
-                    f"trunc(ih*{scale}/2)*2",
-                )
-                await log_operation(
-                    ctx,
-                    f"Resizing video by {scale}x",
-                )
-            elif width is not None:
-                # -2 keeps the auto axis even and aspect-correct.
-                stream = ffmpeg.filter(stream, "scale", str(_even(width)), "-2")
-                await log_operation(
-                    ctx,
-                    f"Resizing video to width {_even(width)}px",
-                )
-            else:  # height
-                assert height is not None  # Type narrowing for type checker
-                stream = ffmpeg.filter(stream, "scale", "-2", str(_even(height)))
-                await log_operation(
-                    ctx,
-                    f"Resizing video to height {_even(height)}px",
-                )
-
-            # map='0:a?' optionally carries audio from the input when present,
-            # avoiding a mapping error on silent sources.
-            output = create_standard_output(
-                stream,
-                str(resolved_output),
-                crf=crf,
-                preset=preset,
-                faststart=_wants_faststart(resolved_output),
-                map="0:a?",
+        if scale is not None:
+            validate_range(
+                scale,
+                0.1,
+                10.0,
+                "Scale factor",
             )
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Video resized and saved to {resolved_output}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise
+            # trunc(...*/2)*2 forces an even result on both axes.
+            stream = ffmpeg.filter(
+                stream,
+                "scale",
+                f"trunc(iw*{scale}/2)*2",
+                f"trunc(ih*{scale}/2)*2",
+            )
+            await log_operation(
+                ctx,
+                f"Resizing video by {scale}x",
+            )
+        elif width is not None:
+            # -2 keeps the auto axis even and aspect-correct.
+            stream = ffmpeg.filter(stream, "scale", str(even_dimension(width)), "-2")
+            await log_operation(
+                ctx,
+                f"Resizing video to width {even_dimension(width)}px",
+            )
+        else:  # height
+            assert height is not None  # Type narrowing for type checker
+            stream = ffmpeg.filter(stream, "scale", "-2", str(even_dimension(height)))
+            await log_operation(
+                ctx,
+                f"Resizing video to height {even_dimension(height)}px",
+            )
+
+        # Only the video is filtered, so map='0:a?' carries the source audio
+        # through when present (and is a no-op on silent sources), while
+        # copy_audio stream-copies it instead of a pointless AAC re-encode.
+        output = create_standard_output(
+            stream,
+            str(resolved_output),
+            crf=crf,
+            preset=preset,
+            faststart=_wants_faststart(resolved_output),
+            copy_audio=True,
+            map="0:a?",
+        )
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
+        return f"Video resized and saved to {resolved_output}"
 
     # Ensure function is registered with MCP
     del resize_video
@@ -485,83 +438,75 @@ def register_basic_video_tools(
             f"({'lossless copy' if use_copy else 're-encode'})",
         )
 
-        try:
-            if use_copy:
-                list_path = _write_concat_list(resolved_inputs)
-                try:
-                    demux = ffmpeg.input(list_path, format="concat", safe=0)
-                    settings: dict[str, str] = {"c": "copy"}
-                    if _wants_faststart(resolved_output):
-                        settings["movflags"] = "+faststart"
-                    output = ffmpeg.output(demux, str(resolved_output), **settings)
-                    await run_ffmpeg_async(output, ctx=ctx)
-                finally:
-                    if os.path.exists(list_path):
-                        os.unlink(list_path)
-                return (
-                    "Videos concatenated (lossless copy) and saved to "
-                    f"{resolved_output}"
+        if use_copy:
+            list_path = _write_concat_list(resolved_inputs)
+            try:
+                demux = ffmpeg.input(list_path, format="concat", safe=0)
+                settings: dict[str, str] = {"c": "copy"}
+                if _wants_faststart(resolved_output):
+                    settings["movflags"] = "+faststart"
+                output = ffmpeg.output(demux, str(resolved_output), **settings)
+                await run_ffmpeg_async(
+                    output, ctx=ctx, output_path=str(resolved_output)
                 )
+            finally:
+                if os.path.exists(list_path):
+                    os.unlink(list_path)
+            return (
+                "Videos concatenated (lossless copy) and saved to "
+                f"{resolved_output}"
+            )
 
-            # Re-encode path with per-input normalization.
-            width, height, fps = _target_geometry(metas)
-            has_audio = ["audio" in m for m in metas]
-            any_audio = any(has_audio)
+        # Re-encode path with per-input normalization.
+        width, height, fps = _target_geometry(metas)
+        has_audio = ["audio" in m for m in metas]
+        any_audio = any(has_audio)
 
-            streams: list[Any] = []
-            for i, path in enumerate(resolved_inputs):
-                inp = ffmpeg.input(str(path))
-                streams.append(_normalize_video(inp.video, width, height, fps))
-                if not any_audio:
-                    continue
-                if has_audio[i]:
-                    streams.append(_normalize_audio(inp.audio))
-                else:
-                    # Inject matched-duration silence for this segment so the
-                    # concat filter's audio and video segment counts align.
-                    duration = metas[i]["duration"] or 0.0
-                    silence = ffmpeg.input(
-                        "anullsrc="
-                        f"channel_layout={_TARGET_CHANNEL_LAYOUT}:"
-                        f"sample_rate={_TARGET_SAMPLE_RATE}",
-                        f="lavfi",
-                        t=duration,
-                    )
-                    streams.append(_normalize_audio(silence.audio))
-
-            n = len(resolved_inputs)
-            faststart = _wants_faststart(resolved_output)
-            if any_audio:
-                joined = ffmpeg.concat(*streams, v=1, a=1, n=n).node
-                enc: dict[str, str | int | float] = {
-                    "vcodec": "libx264",
-                    "pix_fmt": "yuv420p",
-                    "acodec": "aac",
-                }
-                if crf is not None:
-                    enc["crf"] = crf
-                if preset is not None:
-                    enc["preset"] = preset
-                if faststart:
-                    enc["movflags"] = "+faststart"
-                output = ffmpeg.output(
-                    joined[0], joined[1], str(resolved_output), **enc
-                )
+        streams: list[Any] = []
+        for i, path in enumerate(resolved_inputs):
+            inp = ffmpeg.input(str(path))
+            streams.append(
+                normalize_video_stream(inp.video, width=width, height=height, fps=fps)
+            )
+            if not any_audio:
+                continue
+            if has_audio[i]:
+                streams.append(normalize_audio_stream(inp.audio))
             else:
-                joined = ffmpeg.concat(*streams, v=1, a=0, n=n)
-                output = create_standard_output(
-                    joined,
-                    str(resolved_output),
-                    crf=crf,
-                    preset=preset,
-                    faststart=faststart,
-                )
+                # Inject matched-duration silence for this segment so the
+                # concat filter's audio and video segment counts align.
+                duration = metas[i]["duration"] or 0.0
+                silence = silent_audio_source(duration)
+                streams.append(normalize_audio_stream(silence.audio))
 
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Videos concatenated successfully and saved to {resolved_output}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise
+        n = len(resolved_inputs)
+        faststart = _wants_faststart(resolved_output)
+        if any_audio:
+            joined = ffmpeg.concat(*streams, v=1, a=1, n=n).node
+            enc: dict[str, str | int | float] = {
+                "vcodec": "libx264",
+                "pix_fmt": "yuv420p",
+                "acodec": "aac",
+            }
+            if crf is not None:
+                enc["crf"] = crf
+            if preset is not None:
+                enc["preset"] = preset
+            if faststart:
+                enc["movflags"] = "+faststart"
+            output = ffmpeg.output(joined[0], joined[1], str(resolved_output), **enc)
+        else:
+            joined = ffmpeg.concat(*streams, v=1, a=0, n=n)
+            output = create_standard_output(
+                joined,
+                str(resolved_output),
+                crf=crf,
+                preset=preset,
+                faststart=faststart,
+            )
+
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
+        return f"Videos concatenated successfully and saved to {resolved_output}"
 
     # Ensure function is registered with MCP
     del concatenate_videos
@@ -613,32 +558,28 @@ def register_basic_video_tools(
             f"Creating {duration}s video from image at {framerate} fps",
         )
 
-        try:
-            stream = ffmpeg.input(
-                str(resolved_input),
-                loop=1,
-                t=duration,
-                framerate=framerate,
-            )
-            # Force even dimensions; odd-sized stills break yuv420p H.264.
-            stream = ffmpeg.filter(
-                stream,
-                "scale",
-                "trunc(iw/2)*2",
-                "trunc(ih/2)*2",
-            )
-            output = create_standard_output(
-                stream,
-                str(resolved_output),
-                crf=crf,
-                preset=preset,
-                faststart=_wants_faststart(resolved_output),
-            )
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Video created successfully and saved to {resolved_output}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise
+        stream = ffmpeg.input(
+            str(resolved_input),
+            loop=1,
+            t=duration,
+            framerate=framerate,
+        )
+        # Force even dimensions; odd-sized stills break yuv420p H.264.
+        stream = ffmpeg.filter(
+            stream,
+            "scale",
+            "trunc(iw/2)*2",
+            "trunc(ih/2)*2",
+        )
+        output = create_standard_output(
+            stream,
+            str(resolved_output),
+            crf=crf,
+            preset=preset,
+            faststart=_wants_faststart(resolved_output),
+        )
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
+        return f"Video created successfully and saved to {resolved_output}"
 
     # Ensure function is registered with MCP
     del image_to_video

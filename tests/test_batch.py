@@ -38,6 +38,24 @@ def _probe_streams(path: Path) -> tuple[int, int, float]:
     return video, audio, duration
 
 
+def _probe_codecs(path: Path) -> tuple[str, str]:
+    """Return ``(video_codec_name, audio_codec_name)`` for a file."""
+    probe = cast(dict[str, object], ffmpeg.probe(str(path)))
+    streams = cast(list[dict[str, object]], probe["streams"])
+    video = next(
+        (s for s in streams if s.get("codec_type") == "video"),
+        cast(dict[str, object], {}),
+    )
+    audio = next(
+        (s for s in streams if s.get("codec_type") == "audio"),
+        cast(dict[str, object], {}),
+    )
+    return (
+        cast(str, video.get("codec_name", "")),
+        cast(str, audio.get("codec_name", "")),
+    )
+
+
 class TestManifestValidation:
     """Fast unit tests for manifest structural validation."""
 
@@ -267,6 +285,31 @@ class TestStitchFromManifest:
                     {"manifest": [], "output_path": "out.mp4"},
                 )
 
+    @pytest.mark.integration
+    async def test_start_beyond_duration_errors(
+        self,
+        sample_videos: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A ``start`` at or past a clip's duration is rejected clearly.
+
+        The 2s sample clip cannot supply content starting at 5s, so the tool
+        must raise before emitting a 0-length clip that fails opaquely later.
+        """
+        monkeypatch.setenv("VFX_WORKSPACE", str(temp_dir))
+        output_path = temp_dir / "manifest_bad_start.mp4"
+
+        manifest = [{"clip": str(sample_videos[0]), "start": 5.0}]
+
+        async with Client(mcp_server) as client:
+            with pytest.raises(Exception, match="start.*past its duration"):
+                await client.call_tool(
+                    "stitch_from_manifest",
+                    {"manifest": manifest, "output_path": str(output_path)},
+                )
+
 
 class TestBatchConvert:
     """End-to-end tests for ``batch_convert``."""
@@ -298,6 +341,78 @@ class TestBatchConvert:
         for out in outputs:
             _, _, duration = _probe_streams(out)
             assert abs(duration - 2.0) <= 0.3
+
+    @pytest.mark.integration
+    async def test_batch_convert_webm_uses_webm_codecs(
+        self,
+        sample_videos: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Converting to webm must pick a webm-valid codec pairing.
+
+        The webm muxer rejects H.264/AAC, so ``format='webm'`` must select the
+        shared per-container defaults (VP9 video + Vorbis audio) and produce a
+        playable file rather than failing at runtime.
+        """
+        monkeypatch.setenv("VFX_WORKSPACE", str(temp_dir))
+        output_dir = temp_dir / "converted_webm"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "batch_convert",
+                {
+                    "input_paths": [str(sample_videos[0])],
+                    "output_dir": str(output_dir),
+                    "format": "webm",
+                },
+            )
+
+        outputs = sorted(output_dir.glob("*.webm"))
+        assert len(outputs) == 1
+        video_codec, audio_codec = _probe_codecs(outputs[0])
+        # VP8/VP9/AV1 video + Vorbis/Opus audio are the webm-valid pairings.
+        assert video_codec in {"vp8", "vp9", "av1"}
+        assert audio_codec in {"vorbis", "opus"}
+
+    @pytest.mark.integration
+    async def test_batch_convert_same_stem_collision_errors(
+        self,
+        sample_videos: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two inputs with the same stem map to one output and must be rejected.
+
+        ``a/clip.mp4`` and ``b/clip.mp4`` both target ``<out>/clip.mkv``; the
+        tool must raise a clear ``ValueError`` naming the colliding sources
+        rather than racing two concurrent encodes onto one file.
+        """
+        monkeypatch.setenv("VFX_WORKSPACE", str(temp_dir))
+
+        dir_a = temp_dir / "a"
+        dir_b = temp_dir / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        clip_a = dir_a / "clip.mp4"
+        clip_b = dir_b / "clip.mp4"
+        clip_a.write_bytes(sample_videos[0].read_bytes())
+        clip_b.write_bytes(sample_videos[1].read_bytes())
+
+        output_dir = temp_dir / "converted_collision"
+
+        async with Client(mcp_server) as client:
+            with pytest.raises(Exception, match="same output path"):
+                await client.call_tool(
+                    "batch_convert",
+                    {
+                        "input_paths": [str(clip_a), str(clip_b)],
+                        "output_dir": str(output_dir),
+                        "format": "mkv",
+                    },
+                )
 
     @pytest.mark.integration
     async def test_batch_convert_empty_errors(

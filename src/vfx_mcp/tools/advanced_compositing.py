@@ -5,7 +5,6 @@ from fastmcp import Context, FastMCP
 
 from ..core import (
     create_standard_output,
-    handle_ffmpeg_error,
     log_operation,
     parse_color,
     run_ffmpeg_async,
@@ -131,71 +130,66 @@ def register_compositing_tools(
             f"(similarity: {similarity}, blend: {blend})",
         )
 
-        try:
-            input_stream: ffmpeg.Stream = ffmpeg.input(str(resolved_input))
+        input_stream: ffmpeg.Stream = ffmpeg.input(str(resolved_input))
 
-            # Create chromakey filter (adds an alpha channel to the video)
-            keyed: ffmpeg.Stream = ffmpeg.filter(
-                input_stream,
-                "chromakey",
-                color=key_color,
-                similarity=similarity,
-                blend=blend,
+        # Create chromakey filter (adds an alpha channel to the video)
+        keyed: ffmpeg.Stream = ffmpeg.filter(
+            input_stream,
+            "chromakey",
+            color=key_color,
+            similarity=similarity,
+            blend=blend,
+        )
+
+        # Apply spill reduction if needed
+        if spill_reduction > 0:
+            keyed = ffmpeg.filter(
+                keyed,
+                "despill",
+                type=("green" if "green" in chroma_key_color.lower() else "blue"),
+                mix=spill_reduction,
             )
 
-            # Apply spill reduction if needed
-            if spill_reduction > 0:
-                keyed = ffmpeg.filter(
-                    keyed,
-                    "despill",
-                    type=("green" if "green" in chroma_key_color.lower() else "blue"),
-                    mix=spill_reduction,
-                )
-
-            output: ffmpeg.Stream
-            if resolved_background is not None:
-                # Composite the keyed foreground over the background, centered.
-                background: ffmpeg.Stream = ffmpeg.input(str(resolved_background))
-                composited: ffmpeg.Stream = ffmpeg.filter(
-                    [background, keyed],
-                    "overlay",
-                    x="(W-w)/2",
-                    y="(H-h)/2",
-                )
-                # Map the *source* video's audio (input index 1: background is
-                # input 0, the keyed source is input 1); "?" tolerates silent
-                # inputs.
-                output = create_standard_output(
-                    composited,
-                    str(resolved_output),
-                    crf=crf,
-                    preset=preset,
-                    map="1:a?",
-                )
-            else:
-                # Transparent path: write the alpha matte to an alpha-capable
-                # container/codec. Video-only by design.
-                assert alpha_format is not None
-                vcodec, pix_fmt = alpha_format
-                output = ffmpeg.output(
-                    keyed,
-                    str(resolved_output),
-                    vcodec=vcodec,
-                    pix_fmt=pix_fmt,
-                )
-
-            await run_ffmpeg_async(output, ctx=ctx)
-
-            bg_msg = (
-                " with custom background"
-                if resolved_background is not None
-                else " with transparent background"
+        output: ffmpeg.Stream
+        if resolved_background is not None:
+            # Composite the keyed foreground over the background, centered.
+            background: ffmpeg.Stream = ffmpeg.input(str(resolved_background))
+            composited: ffmpeg.Stream = ffmpeg.filter(
+                [background, keyed],
+                "overlay",
+                x="(W-w)/2",
+                y="(H-h)/2",
             )
-            return f"Green screen effect applied{bg_msg} and saved to {resolved_output}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            # handle_ffmpeg_error always raises, so this is unreachable
-            raise
+            # Map the *source* video's audio (input index 1: background is
+            # input 0, the keyed source is input 1); "?" tolerates silent
+            # inputs.
+            output = create_standard_output(
+                composited,
+                str(resolved_output),
+                crf=crf,
+                preset=preset,
+                map="1:a?",
+            )
+        else:
+            # Transparent path: write the alpha matte to an alpha-capable
+            # container/codec. Video-only by design.
+            assert alpha_format is not None
+            vcodec, pix_fmt = alpha_format
+            output = ffmpeg.output(
+                keyed,
+                str(resolved_output),
+                vcodec=vcodec,
+                pix_fmt=pix_fmt,
+            )
+
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
+
+        bg_msg = (
+            " with custom background"
+            if resolved_background is not None
+            else " with transparent background"
+        )
+        return f"Green screen effect applied{bg_msg} and saved to {resolved_output}"
 
     @mcp.tool
     async def apply_motion_blur(
@@ -245,35 +239,30 @@ def register_compositing_tools(
             f"Applying motion blur (strength: {blur_strength}, angle: {angle}°)...",
         )
 
-        try:
-            stream: ffmpeg.Stream = ffmpeg.input(str(resolved_input))
+        stream: ffmpeg.Stream = ffmpeg.input(str(resolved_input))
 
-            # Convert strength to a valid boxblur radius. boxblur's luma_radius
-            # is a single (isotropic) expression and luma_power is separate —
-            # the angle is approximated via blur power since boxblur cannot
-            # apply a truly directional kernel on its own.
-            blur_amount = int(blur_strength * 3) * 2 + 1  # Odd number for kernel size
-            stream = ffmpeg.filter(
-                stream,
-                "boxblur",
-                luma_radius=blur_amount,
-                luma_power=1,
-            )
+        # Convert strength to a valid boxblur radius. boxblur's luma_radius
+        # is a single (isotropic) expression and luma_power is separate —
+        # the angle is approximated via blur power since boxblur cannot
+        # apply a truly directional kernel on its own.
+        blur_amount = int(blur_strength * 3) * 2 + 1  # Odd number for kernel size
+        stream = ffmpeg.filter(
+            stream,
+            "boxblur",
+            luma_radius=blur_amount,
+            luma_power=1,
+        )
 
-            output: ffmpeg.Stream = create_standard_output(
-                stream,
-                str(resolved_output),
-                crf=crf,
-                preset=preset,
-                map="0:a?",
-            )
-            await run_ffmpeg_async(output, ctx=ctx)
+        output: ffmpeg.Stream = create_standard_output(
+            stream,
+            str(resolved_output),
+            crf=crf,
+            preset=preset,
+            map="0:a?",
+        )
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
 
-            return (
-                f"Motion blur applied (strength: {blur_strength}, angle: {angle}°) "
-                f"and saved to {resolved_output}"
-            )
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            # handle_ffmpeg_error always raises, so this is unreachable
-            raise
+        return (
+            f"Motion blur applied (strength: {blur_strength}, angle: {angle}°) "
+            f"and saved to {resolved_output}"
+        )

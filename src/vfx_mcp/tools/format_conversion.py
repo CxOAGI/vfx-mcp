@@ -34,28 +34,15 @@ import ffmpeg
 from fastmcp import Context, FastMCP
 
 from ..core import (
+    DEFAULT_AUDIO_CODEC,
+    DEFAULT_VIDEO_CODEC,
+    FORMAT_CODECS,
     create_standard_output,
-    handle_ffmpeg_error,
     log_operation,
     run_ffmpeg_async,
     safe_input_path,
     safe_output_path,
 )
-
-# Fallback codecs used when neither the caller nor the target ``format`` picks
-# a codec. libx264/aac is the most broadly compatible MP4 pairing.
-_DEFAULT_VIDEO_CODEC = "libx264"
-_DEFAULT_AUDIO_CODEC = "aac"
-
-# Per-container codec defaults. Passing ``format`` only sets these DEFAULTS; an
-# explicit ``video_codec``/``audio_codec`` argument always wins (see M4).
-_FORMAT_CODECS: dict[str, dict[str, str]] = {
-    "mp4": {"video": "libx264", "audio": "aac"},
-    "avi": {"video": "libx264", "audio": "mp3"},
-    "mkv": {"video": "libx264", "audio": "aac"},
-    "webm": {"video": "libvpx-vp9", "audio": "libvorbis"},
-    "mov": {"video": "libx264", "audio": "aac"},
-}
 
 # Container families that support the MP4/MOV ``moov`` atom and therefore
 # benefit from ``-movflags +faststart`` for progressive (streamed) playback.
@@ -148,16 +135,16 @@ def register_format_conversion_tools(
 
         # ``format`` only supplies DEFAULTS; an explicit codec argument wins
         # (M4). We detect "explicit" by the argument being non-None.
-        format_defaults = _FORMAT_CODECS.get(format.lower(), {}) if format else {}
+        format_defaults = FORMAT_CODECS.get(format.lower(), {}) if format else {}
         resolved_video_codec = (
             video_codec
             if video_codec is not None
-            else format_defaults.get("video", _DEFAULT_VIDEO_CODEC)
+            else format_defaults.get("video", DEFAULT_VIDEO_CODEC)
         )
         resolved_audio_codec = (
             audio_codec
             if audio_codec is not None
-            else format_defaults.get("audio", _DEFAULT_AUDIO_CODEC)
+            else format_defaults.get("audio", DEFAULT_AUDIO_CODEC)
         )
 
         faststart = _wants_faststart(output_path, format)
@@ -170,25 +157,21 @@ def register_format_conversion_tools(
             f"preset: {preset or 'default'}, faststart: {faststart})",
         )
 
-        try:
-            stream = ffmpeg.input(str(resolved_input))
+        stream = ffmpeg.input(str(resolved_input))
 
-            output = create_standard_output(
-                stream,
-                str(resolved_output),
-                crf=crf,
-                preset=preset,
-                video_bitrate=video_bitrate,
-                audio_bitrate=audio_bitrate,
-                faststart=faststart,
-                vcodec=resolved_video_codec,
-                acodec=resolved_audio_codec,
-            )
-            await run_ffmpeg_async(output, ctx=ctx)
-            return f"Format converted successfully and saved to {output_path}"
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise  # This line is never reached but satisfies type checker
+        output = create_standard_output(
+            stream,
+            str(resolved_output),
+            crf=crf,
+            preset=preset,
+            video_bitrate=video_bitrate,
+            audio_bitrate=audio_bitrate,
+            faststart=faststart,
+            vcodec=resolved_video_codec,
+            acodec=resolved_audio_codec,
+        )
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
+        return f"Format converted successfully and saved to {output_path}"
 
     # Acknowledge that the function is registered with MCP
     _ = convert_format

@@ -29,35 +29,22 @@ import ffmpeg
 from fastmcp import Context, FastMCP
 
 from ..core import (
+    DEFAULT_AUDIO_CODEC,
+    DEFAULT_VIDEO_CODEC,
+    FORMAT_CODECS,
+    XFADE_TRANSITION_MAP,
     create_standard_output,
+    even_dimension,
     get_video_metadata,
-    handle_ffmpeg_error,
     log_operation,
+    normalize_audio_stream,
+    normalize_video_stream,
     run_ffmpeg_async,
     safe_input_path,
     safe_output_path,
+    silent_audio_source,
     validate_transition_type,
 )
-
-# Map the review's transition vocabulary (as normalized by
-# ``validate_transition_type``) onto the names understood by FFmpeg's ``xfade``
-# filter. ``crossfade`` is an alias for a plain fade.
-_XFADE_TRANSITION_MAP: dict[str, str] = {
-    "fade": "fade",
-    "crossfade": "fade",
-    "dissolve": "dissolve",
-    "wipe_left": "wipeleft",
-    "wipe_right": "wiperight",
-    "wipe_up": "wipeup",
-    "wipe_down": "wipedown",
-    "slide_left": "slideleft",
-    "slide_right": "slideright",
-}
-
-# Canonical audio format used for the transition/concat graph so that clips with
-# differing sample rates / channel layouts (and injected silence) join cleanly.
-_TARGET_SAMPLE_RATE = 44100
-_TARGET_CHANNEL_LAYOUT = "stereo"
 
 # Default crossfade length (seconds) when a manifest entry requests a transition
 # but does not specify ``transition_duration``.
@@ -77,12 +64,6 @@ class _ManifestEntry:
     end: float | None
     transition: str | None
     transition_duration: float | None
-
-
-def _even(value: int) -> int:
-    """Round ``value`` up to the nearest even integer (libx264/yuv420p safe)."""
-    value = max(value, 2)
-    return value if value % 2 == 0 else value + 1
 
 
 def _as_optional_number(value: object, field: str, index: int) -> float | None:
@@ -191,10 +172,10 @@ def _normalize_video(
 ) -> ffmpeg.Stream:
     """Trim (if requested) then conform a video stream to a canonical shape.
 
-    ``xfade`` and the ``concat`` filter both require their inputs to share an
-    identical resolution, pixel format, SAR and frame rate, so every clip is
-    conformed to the same target. Aspect ratio is preserved by scaling to fit
-    and letterbox/pillarbox padding the remainder.
+    The trim/``setpts`` in-point handling is manifest-specific and lives here;
+    the geometry/fps/SAR/pixel-format conforming is delegated to the shared
+    :func:`normalize_video_stream` so every stitching path in the codebase
+    conforms clips identically.
     """
     if entry.start is not None or entry.end is not None:
         trim_kwargs: dict[str, float] = {}
@@ -205,28 +186,16 @@ def _normalize_video(
         stream = ffmpeg.filter(stream, "trim", **trim_kwargs)
         stream = ffmpeg.filter(stream, "setpts", "PTS-STARTPTS")
 
-    stream = ffmpeg.filter(
-        stream,
-        "scale",
-        width,
-        height,
-        force_original_aspect_ratio="decrease",
-    )
-    stream = ffmpeg.filter(
-        stream,
-        "pad",
-        width,
-        height,
-        "(ow-iw)/2",
-        "(oh-ih)/2",
-    )
-    stream = ffmpeg.filter(stream, "setsar", "1")
-    stream = ffmpeg.filter(stream, "fps", fps)
-    return ffmpeg.filter(stream, "format", "yuv420p")
+    return normalize_video_stream(stream, width=width, height=height, fps=fps)
 
 
 def _normalize_audio(stream: ffmpeg.Stream, entry: _ManifestEntry) -> ffmpeg.Stream:
-    """Trim (if requested) then conform audio to the canonical format."""
+    """Trim (if requested) then conform audio to the canonical format.
+
+    The manifest-specific ``atrim``/``asetpts`` in-point handling lives here;
+    conforming to the canonical sample rate / channel layout is delegated to
+    the shared :func:`normalize_audio_stream`.
+    """
     if entry.start is not None or entry.end is not None:
         atrim_kwargs: dict[str, float] = {}
         if entry.start is not None:
@@ -236,22 +205,7 @@ def _normalize_audio(stream: ffmpeg.Stream, entry: _ManifestEntry) -> ffmpeg.Str
         stream = ffmpeg.filter(stream, "atrim", **atrim_kwargs)
         stream = ffmpeg.filter(stream, "asetpts", "PTS-STARTPTS")
 
-    return ffmpeg.filter(
-        stream,
-        "aformat",
-        sample_rates=_TARGET_SAMPLE_RATE,
-        channel_layouts=_TARGET_CHANNEL_LAYOUT,
-    )
-
-
-def _silent_audio(duration: float) -> ffmpeg.Stream:
-    """Create a bounded silent audio source for a clip with no audio track."""
-    return ffmpeg.input(
-        f"anullsrc=channel_layout={_TARGET_CHANNEL_LAYOUT}"
-        f":sample_rate={_TARGET_SAMPLE_RATE}",
-        f="lavfi",
-        t=duration,
-    )
+    return normalize_audio_stream(stream)
 
 
 def _build_manifest_streams(
@@ -301,7 +255,7 @@ def _build_manifest_streams(
             # trim points are already baked into ``duration``.
             audio_streams.append(
                 _normalize_audio(
-                    _silent_audio(duration),
+                    silent_audio_source(duration),
                     _ManifestEntry(
                         clip=entry.clip,
                         start=None,
@@ -329,7 +283,7 @@ def _build_manifest_streams(
                 if entry.transition_duration is not None
                 else _DEFAULT_TRANSITION_DURATION
             )
-            xfade_name = _XFADE_TRANSITION_MAP[
+            xfade_name = XFADE_TRANSITION_MAP[
                 validate_transition_type(entry.transition)
             ]
             offset = cumulative - transition_duration
@@ -445,6 +399,11 @@ def register_automation_tools(
                 raise ValueError(f"No video stream found in '{path.name}'")
 
             full_duration = metadata["duration"]
+            if entry.start is not None and entry.start >= full_duration:
+                raise ValueError(
+                    f"'{path.name}' start ({entry.start}s) is at or past its "
+                    f"duration ({full_duration}s); the clip would be empty"
+                )
             if entry.end is not None and entry.end > full_duration:
                 raise ValueError(
                     f"'{path.name}' end ({entry.end}s) exceeds its duration "
@@ -485,50 +444,43 @@ def register_automation_tools(
             else:
                 cumulative += durations[index]
 
-        target_width = _even(target_width)
-        target_height = _even(target_height)
+        target_width = even_dimension(target_width)
+        target_height = even_dimension(target_height)
         fps = round(target_fps) if target_fps > 0 else 30
 
-        try:
-            video_stream, audio_stream = _build_manifest_streams(
-                entries,
-                [str(path) for path in resolved_inputs],
-                durations,
-                has_audio,
-                target_width=target_width,
-                target_height=target_height,
-                target_fps=fps,
-            )
+        video_stream, audio_stream = _build_manifest_streams(
+            entries,
+            [str(path) for path in resolved_inputs],
+            durations,
+            has_audio,
+            target_width=target_width,
+            target_height=target_height,
+            target_fps=fps,
+        )
 
-            # The video (xfade/concat) and audio (acrossfade/concat) streams are
-            # separate graph outputs, so mux them directly while mirroring the
-            # standard libx264/yuv420p/aac settings and quality controls.
-            output_kwargs: dict[str, str | int | float] = {
-                "vcodec": "libx264",
-                "pix_fmt": "yuv420p",
-                "acodec": "aac",
-            }
-            if crf is not None:
-                output_kwargs["crf"] = crf
-            if preset is not None:
-                output_kwargs["preset"] = preset
-            if faststart:
-                output_kwargs["movflags"] = "+faststart"
+        # The video (xfade/concat) and audio (acrossfade/concat) streams are
+        # separate graph outputs, so mux them directly while mirroring the
+        # standard libx264/yuv420p/aac settings and quality controls.
+        output_kwargs: dict[str, str | int | float] = {
+            "vcodec": "libx264",
+            "pix_fmt": "yuv420p",
+            "acodec": "aac",
+        }
+        if crf is not None:
+            output_kwargs["crf"] = crf
+        if preset is not None:
+            output_kwargs["preset"] = preset
+        if faststart:
+            output_kwargs["movflags"] = "+faststart"
 
-            output = ffmpeg.output(
-                video_stream,
-                audio_stream,
-                str(resolved_output),
-                **output_kwargs,
-            )
-            await run_ffmpeg_async(output, ctx=ctx)
-            return (
-                f"Stitched {len(entries)} clips from manifest and saved to "
-                f"{output_path}"
-            )
-        except ffmpeg.Error as e:
-            await handle_ffmpeg_error(e, ctx)
-            raise
+        output = ffmpeg.output(
+            video_stream,
+            audio_stream,
+            str(resolved_output),
+            **output_kwargs,
+        )
+        await run_ffmpeg_async(output, ctx=ctx, output_path=str(resolved_output))
+        return f"Stitched {len(entries)} clips from manifest and saved to {output_path}"
 
     # Ensure the function is registered with MCP.
     del stitch_from_manifest
@@ -574,6 +526,13 @@ def register_automation_tools(
         ext = format.lower().lstrip(".")
         faststart = ext in _FASTSTART_FORMATS
 
+        # Pick the encoders from the shared per-container defaults so that
+        # non-mp4 containers (e.g. webm needs VP8/9/AV1 + Vorbis/Opus) mux valid
+        # streams instead of failing at runtime with the hardcoded libx264/aac.
+        codecs = FORMAT_CODECS.get(ext, {})
+        vcodec = codecs.get("video", DEFAULT_VIDEO_CODEC)
+        acodec = codecs.get("audio", DEFAULT_AUDIO_CODEC)
+
         # Resolve/validate everything up front so a bad path fails fast before
         # any encode is launched.
         resolved_inputs = [safe_input_path(path) for path in input_paths]
@@ -581,6 +540,24 @@ def register_automation_tools(
             safe_output_path(str(Path(output_dir) / f"{src.stem}.{ext}"))
             for src in resolved_inputs
         ]
+
+        # Two inputs sharing a stem (e.g. a/clip.mp4 and b/clip.mp4) would map to
+        # the same output file and race each other's concurrent encodes. Detect
+        # that up front rather than silently overwriting one with the other.
+        collisions: dict[str, list[str]] = {}
+        for src, dst in zip(resolved_inputs, resolved_outputs, strict=True):
+            collisions.setdefault(str(dst), []).append(str(src))
+        colliding = {
+            dst: sources for dst, sources in collisions.items() if len(sources) > 1
+        }
+        if colliding:
+            detail = "; ".join(
+                f"{dst} <- [{', '.join(sources)}]" for dst, sources in colliding.items()
+            )
+            raise ValueError(
+                "batch_convert: multiple inputs map to the same output path "
+                f"(distinct output names required): {detail}"
+            )
 
         await log_operation(
             ctx,
@@ -596,12 +573,10 @@ def register_automation_tools(
                 crf=crf,
                 preset=preset,
                 faststart=faststart,
+                vcodec=vcodec,
+                acodec=acodec,
             )
-            try:
-                await run_ffmpeg_async(output, ctx=ctx)
-            except ffmpeg.Error as e:
-                await handle_ffmpeg_error(e, ctx)
-                raise
+            await run_ffmpeg_async(output, ctx=ctx, output_path=str(dst))
             return str(dst)
 
         results = await asyncio.gather(
