@@ -21,6 +21,7 @@ from fastmcp import Client
 
 class VideoInfo(TypedDict, total=False):
     """Type definition for video stream information."""
+
     width: int
     height: int
     codec: str
@@ -28,11 +29,13 @@ class VideoInfo(TypedDict, total=False):
 
 class AudioInfo(TypedDict, total=False):
     """Type definition for audio stream information."""
+
     codec: str
 
 
 class VideoMetadata(TypedDict, total=False):
     """Type definition for video metadata returned by get_video_info."""
+
     duration: float
     video: VideoInfo
     audio: AudioInfo
@@ -43,19 +46,19 @@ def parse_video_metadata(text: str) -> VideoMetadata | None:
     try:
         # Parse JSON - we accept the Any type here as it's unavoidable
         json_data: object = json.loads(text)
-        
+
         # Type guard to ensure we have a dict
         if not isinstance(json_data, dict):
             return None
-            
+
         # Now build the typed result with explicit checking
         result: VideoMetadata = {}
-        
+
         # Check duration with explicit type narrowing
         duration_raw = json_data.get("duration")
-        if isinstance(duration_raw, (int, float)):
+        if isinstance(duration_raw, int | float):
             result["duration"] = float(duration_raw)
-            
+
         # Check video with explicit type narrowing
         video_raw = json_data.get("video")
         if isinstance(video_raw, dict):
@@ -64,31 +67,31 @@ def parse_video_metadata(text: str) -> VideoMetadata | None:
             width_raw = video_raw.get("width")
             height_raw = video_raw.get("height")
             codec_raw = video_raw.get("codec")
-            
+
             if isinstance(width_raw, int):
                 video_info["width"] = width_raw
             if isinstance(height_raw, int):
                 video_info["height"] = height_raw
             if isinstance(codec_raw, str):
                 video_info["codec"] = codec_raw
-                
+
             if video_info:  # Only add if we found valid data
                 result["video"] = video_info
-                
+
         # Check audio with explicit type narrowing
         audio_raw = json_data.get("audio")
         if isinstance(audio_raw, dict):
             audio_info: AudioInfo = {}
             codec_raw = audio_raw.get("codec")
-            
+
             if isinstance(codec_raw, str):
                 audio_info["codec"] = codec_raw
-                
+
             if audio_info:  # Only add if we found valid data
                 result["audio"] = audio_info
-                
+
         return result if result else None
-        
+
     except (json.JSONDecodeError, ValueError):
         return None
 
@@ -235,7 +238,7 @@ async def create_montage() -> None:
                 duration = metadata.get("duration")
                 if duration is not None:
                     print(f"   Duration: {duration:.2f} seconds")
-                
+
                 video_info = metadata.get("video")
                 if video_info:
                     width = video_info.get("width")
@@ -245,7 +248,7 @@ async def create_montage() -> None:
                         print(f"   Resolution: {width}x{height}")
                     if codec is not None:
                         print(f"   Video codec: {codec}")
-                
+
                 audio_info = metadata.get("audio")
                 if audio_info:
                     audio_codec = audio_info.get("codec")

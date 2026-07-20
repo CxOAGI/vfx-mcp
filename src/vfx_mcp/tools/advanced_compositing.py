@@ -8,10 +8,24 @@ from ..core import (
     handle_ffmpeg_error,
     log_operation,
     parse_color,
+    run_ffmpeg_async,
+    safe_input_path,
+    safe_output_path,
     validate_range,
 )
 
 __all__ = ["register_compositing_tools"]
+
+# Alpha-capable output formats for the transparent-background chroma-key path.
+# yuv420p H.264 (the standard output) has no alpha channel, so a transparent
+# result requires a container/codec pairing that actually carries alpha. Each
+# entry maps an output extension to the (vcodec, pix_fmt) needed to preserve the
+# chroma-keyed alpha matte losslessly (QuickTime RLE) or with alpha (VP9).
+_ALPHA_OUTPUT_FORMATS: dict[str, tuple[str, str]] = {
+    ".mov": ("qtrle", "argb"),
+    ".webm": ("libvpx-vp9", "yuva420p"),
+    ".mkv": ("libvpx-vp9", "yuva420p"),
+}
 
 
 def register_compositing_tools(
@@ -28,30 +42,56 @@ def register_compositing_tools(
         similarity: float = 0.3,
         blend: float = 0.1,
         spill_reduction: float = 0.5,
+        crf: int | None = None,
+        preset: str | None = None,
         ctx: Context | None = None,
     ) -> str:
-        """Remove green/blue screen and composite with background.
+        """Remove green/blue screen and composite with a background or alpha.
 
         Advanced chroma key compositing with adjustable parameters for
         professional green screen removal and background replacement.
 
+        When ``background_path`` is provided, the keyed foreground is overlaid
+        (centered) on the background and encoded as a standard H.264/AAC MP4,
+        preserving the *source* video's audio track. When ``background_path``
+        is ``None`` the tool produces a genuinely transparent result: the
+        chroma-keyed alpha matte is written to an alpha-capable container/codec
+        chosen from the output extension. Because H.264/yuv420p cannot carry
+        an alpha channel, the transparent path requires an alpha-capable output
+        extension:
+
+        - ``.mov`` -> QuickTime RLE (``qtrle``, ARGB, lossless)
+        - ``.webm`` / ``.mkv`` -> VP9 (``libvpx-vp9``, ``yuva420p``)
+
+        The transparent output is video-only (the alpha matte); audio is not
+        carried through since alpha-matte deliverables are composited later.
+
         Args:
             input_path: Path to the input video with green/blue screen.
-            output_path: Path where the composited video will be saved.
-            background_path: Path to background image/video. If None, creates
-                transparent background.
-            chroma_key_color: Color to remove ("green", "blue", "red", or hex code
-                like "#00FF00").
-            similarity: Color similarity threshold (0.0 to 1.0). Lower = more precise.
+            output_path: Path where the composited video will be saved. For the
+                transparent path (no background) this must end in ``.mov``,
+                ``.webm`` or ``.mkv``.
+            background_path: Path to background image/video. If None, produces a
+                transparent (alpha) result instead of compositing.
+            chroma_key_color: Color to remove ("green", "blue", "red", or hex
+                code like "#00FF00").
+            similarity: Color similarity threshold (0.0 to 1.0). Lower = more
+                precise.
             blend: Edge blending amount (0.0 to 1.0) for smoother edges.
             spill_reduction: Color spill reduction strength (0.0 to 1.0).
+            crf: Constant Rate Factor for the composited (H.264) output; lower
+                is higher quality. Ignored on the transparent path. Defaults to
+                the encoder default when omitted.
+            preset: libx264 speed/quality preset for the composited output
+                (e.g. "ultrafast", "medium"). Ignored on the transparent path.
             ctx: MCP context for progress reporting and logging.
 
         Returns:
             Success message indicating green screen effect was applied.
 
         Raises:
-            ValueError: If parameter values are out of valid ranges.
+            ValueError: If parameter values are out of valid ranges, or the
+                transparent path is requested with a non-alpha output extension.
             RuntimeError: If ffmpeg encounters an error during processing.
         """
         validate_range(similarity, 0.0, 1.0, "Similarity")
@@ -63,6 +103,25 @@ def register_compositing_tools(
             "Spill reduction",
         )
 
+        resolved_input = safe_input_path(input_path)
+        resolved_output = safe_output_path(output_path)
+        resolved_background = (
+            safe_input_path(background_path) if background_path else None
+        )
+
+        # For the transparent path, fail fast (before any encoding) if the
+        # requested container/codec cannot carry an alpha channel.
+        alpha_format: tuple[str, str] | None = None
+        if resolved_background is None:
+            suffix = resolved_output.suffix.lower()
+            alpha_format = _ALPHA_OUTPUT_FORMATS.get(suffix)
+            if alpha_format is None:
+                supported = ", ".join(sorted(_ALPHA_OUTPUT_FORMATS))
+                raise ValueError(
+                    "Transparent background output requires an alpha-capable "
+                    f"container/codec. Use one of: {supported}. Got: {output_path}"
+                )
+
         # Parse color to ffmpeg format
         key_color = parse_color(chroma_key_color)
 
@@ -73,9 +132,9 @@ def register_compositing_tools(
         )
 
         try:
-            input_stream: ffmpeg.Stream = ffmpeg.input(input_path)
+            input_stream: ffmpeg.Stream = ffmpeg.input(str(resolved_input))
 
-            # Create chromakey filter
+            # Create chromakey filter (adds an alpha channel to the video)
             keyed: ffmpeg.Stream = ffmpeg.filter(
                 input_stream,
                 "chromakey",
@@ -93,35 +152,46 @@ def register_compositing_tools(
                     mix=spill_reduction,
                 )
 
-            output_stream: ffmpeg.Stream
-            if background_path:
-                # Composite with background
-                background: ffmpeg.Stream = ffmpeg.input(background_path)
-                output_stream = ffmpeg.filter(
+            output: ffmpeg.Stream
+            if resolved_background is not None:
+                # Composite the keyed foreground over the background, centered.
+                background: ffmpeg.Stream = ffmpeg.input(str(resolved_background))
+                composited: ffmpeg.Stream = ffmpeg.filter(
                     [background, keyed],
                     "overlay",
                     x="(W-w)/2",
                     y="(H-h)/2",
                 )
+                # Map the *source* video's audio (input index 1: background is
+                # input 0, the keyed source is input 1); "?" tolerates silent
+                # inputs.
+                output = create_standard_output(
+                    composited,
+                    str(resolved_output),
+                    crf=crf,
+                    preset=preset,
+                    map="1:a?",
+                )
             else:
-                # Transparent background
-                output_stream = keyed
+                # Transparent path: write the alpha matte to an alpha-capable
+                # container/codec. Video-only by design.
+                assert alpha_format is not None
+                vcodec, pix_fmt = alpha_format
+                output = ffmpeg.output(
+                    keyed,
+                    str(resolved_output),
+                    vcodec=vcodec,
+                    pix_fmt=pix_fmt,
+                )
 
-            output: ffmpeg.Stream = ffmpeg.output(
-                output_stream,
-                output_path,
-                vcodec="libx264",
-                pix_fmt="yuv420p",
-                map="0:a?",
-            )
-            ffmpeg.run(output, overwrite_output=True)
+            await run_ffmpeg_async(output, ctx=ctx)
 
             bg_msg = (
                 " with custom background"
-                if background_path
+                if resolved_background is not None
                 else " with transparent background"
             )
-            return f"Green screen effect applied{bg_msg} and saved to {output_path}"
+            return f"Green screen effect applied{bg_msg} and saved to {resolved_output}"
         except ffmpeg.Error as e:
             await handle_ffmpeg_error(e, ctx)
             # handle_ffmpeg_error always raises, so this is unreachable
@@ -133,6 +203,8 @@ def register_compositing_tools(
         output_path: str,
         blur_strength: float = 1.0,
         angle: float = 0.0,
+        crf: int | None = None,
+        preset: str | None = None,
         ctx: Context | None = None,
     ) -> str:
         """Apply motion blur effect to simulate camera or object movement.
@@ -145,6 +217,9 @@ def register_compositing_tools(
             output_path: Path where the motion-blurred video will be saved.
             blur_strength: Blur intensity (0.1 to 3.0). Higher = more blur.
             angle: Blur direction angle in degrees (0 to 360).
+            crf: Constant Rate Factor for the H.264 output; lower is higher
+                quality. Defaults to the encoder default when omitted.
+            preset: libx264 speed/quality preset (e.g. "ultrafast", "medium").
             ctx: MCP context for progress reporting and logging.
 
         Returns:
@@ -162,56 +237,41 @@ def register_compositing_tools(
         )
         validate_range(angle, 0, 360, "Angle")
 
+        resolved_input = safe_input_path(input_path)
+        resolved_output = safe_output_path(output_path)
+
         await log_operation(
             ctx,
             f"Applying motion blur (strength: {blur_strength}, angle: {angle}°)...",
         )
 
         try:
-            stream: ffmpeg.Stream = ffmpeg.input(input_path)
+            stream: ffmpeg.Stream = ffmpeg.input(str(resolved_input))
 
-            # Convert angle and strength to blur parameters
+            # Convert strength to a valid boxblur radius. boxblur's luma_radius
+            # is a single (isotropic) expression and luma_power is separate —
+            # the angle is approximated via blur power since boxblur cannot
+            # apply a truly directional kernel on its own.
             blur_amount = int(blur_strength * 3) * 2 + 1  # Odd number for kernel size
+            stream = ffmpeg.filter(
+                stream,
+                "boxblur",
+                luma_radius=blur_amount,
+                luma_power=1,
+            )
 
-            # Create motion blur kernel based on angle
-            # Note: Complex motion blur math would go here in a real implementation
-
-            # For simplicity, use mblur filter with approximated settings
-            if angle < 45 or angle > 315:
-                # Horizontal blur
-                stream = ffmpeg.filter(
-                    stream,
-                    "boxblur",
-                    luma_radius=f"{blur_amount}:1",
-                )
-            elif 45 <= angle < 135:
-                # Vertical blur
-                stream = ffmpeg.filter(
-                    stream,
-                    "boxblur",
-                    luma_radius=f"1:{blur_amount}",
-                )
-            elif 135 <= angle < 225:
-                # Horizontal blur (reverse)
-                stream = ffmpeg.filter(
-                    stream,
-                    "boxblur",
-                    luma_radius=f"{blur_amount}:1",
-                )
-            else:
-                # Vertical blur (reverse)
-                stream = ffmpeg.filter(
-                    stream,
-                    "boxblur",
-                    luma_radius=f"1:{blur_amount}",
-                )
-
-            output: ffmpeg.Stream = create_standard_output(stream, output_path, map="0:a?")
-            ffmpeg.run(output, overwrite_output=True)
+            output: ffmpeg.Stream = create_standard_output(
+                stream,
+                str(resolved_output),
+                crf=crf,
+                preset=preset,
+                map="0:a?",
+            )
+            await run_ffmpeg_async(output, ctx=ctx)
 
             return (
                 f"Motion blur applied (strength: {blur_strength}, angle: {angle}°) "
-                f"and saved to {output_path}"
+                f"and saved to {resolved_output}"
             )
         except ffmpeg.Error as e:
             await handle_ffmpeg_error(e, ctx)

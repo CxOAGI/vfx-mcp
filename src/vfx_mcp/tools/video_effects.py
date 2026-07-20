@@ -32,11 +32,80 @@ from fastmcp import Context, FastMCP
 
 from ..core import (
     create_standard_output,
+    get_video_metadata,
     handle_ffmpeg_error,
     log_operation,
+    run_ffmpeg_async,
+    safe_input_path,
+    safe_output_path,
     validate_filter_name,
     validate_range,
 )
+
+
+def _force_even(value: int) -> int:
+    """Round a scale dimension to an even number libx264/yuv420p accepts.
+
+    Positive values are rounded down to the nearest even integer. The ffmpeg
+    "auto" sentinel ``-1`` is mapped to ``-2`` so ffmpeg preserves aspect ratio
+    while still producing an even dimension.
+
+    Args:
+        value: The requested scale dimension.
+
+    Returns:
+        An even dimension (or ``-2`` for the auto sentinel).
+    """
+    if value < 0:
+        return -2
+    return value - (value % 2)
+
+
+def _speed_output_settings(
+    crf: int | None,
+    preset: str | None,
+) -> dict[str, str | int | float]:
+    """Build encoder settings for a two-stream (video + audio) speed output.
+
+    Mirrors the defaults of :func:`create_standard_output` (libx264 / yuv420p /
+    aac) while honouring the optional ``crf`` and ``preset`` quality controls.
+    Needed because ``create_standard_output`` maps only a single stream, whereas
+    a sped-up clip with audio must map both a video and an audio stream.
+
+    Args:
+        crf: Optional Constant Rate Factor for libx264.
+        preset: Optional libx264 speed/quality preset.
+
+    Returns:
+        Keyword settings suitable for :func:`ffmpeg.output`.
+    """
+    settings: dict[str, str | int | float] = {
+        "vcodec": "libx264",
+        "pix_fmt": "yuv420p",
+        "acodec": "aac",
+    }
+    if crf is not None:
+        settings["crf"] = crf
+    if preset is not None:
+        settings["preset"] = preset
+    return settings
+
+
+def _has_audio_stream(video_path: str) -> bool:
+    """Return ``True`` when the file at ``video_path`` carries an audio stream.
+
+    Silent sources (e.g. Veo 2 output) have no audio stream, so tools that map
+    ``stream["a"]`` must guard against them. Metadata is gathered via
+    :func:`get_video_metadata`, whose result only includes an ``"audio"`` key
+    when an audio stream is present.
+
+    Args:
+        video_path: Path to the video file to probe.
+
+    Returns:
+        ``True`` if an audio stream exists, ``False`` otherwise.
+    """
+    return "audio" in get_video_metadata(video_path)
 
 
 def register_video_effects_tools(
@@ -60,12 +129,16 @@ def register_video_effects_tools(
         output_path: str,
         filter: str,
         strength: float = 1.0,
+        crf: int | None = None,
+        preset: str | None = None,
         ctx: Context | None = None,
     ) -> str:
         """Apply visual effects filter to a video.
 
         Applies various visual filters to enhance or stylize video content.
         Filter strength can be adjusted to control the intensity of the effect.
+        The video stream is re-encoded (libx264) while any existing audio track
+        is preserved.
 
         Available filters:
             - brightness: Brightens or darkens the video (0.1-3.0)
@@ -77,13 +150,17 @@ def register_video_effects_tools(
             - blur: Applies gaussian blur (strength controls radius)
             - sharpen: Applies unsharp mask sharpening (0.1-3.0)
             - vintage: Applies vintage color grading
-            - scale=WxH: Resizes to specific dimensions
+            - scale=WxH: Resizes to specific dimensions (rounded to even values)
 
         Args:
             input_path: Path to the input video file.
             output_path: Path where the filtered video will be saved.
             filter: Name of the filter to apply. See available filters above.
             strength: Filter intensity (0.1 to 3.0). 1.0 = normal strength.
+            crf: Optional libx264 Constant Rate Factor (0-51, lower is higher
+                quality). Defaults to the encoder default when omitted.
+            preset: Optional libx264 speed/quality preset (e.g. ``"ultrafast"``,
+                ``"medium"``). Defaults to the encoder default when omitted.
             ctx: MCP context for progress reporting and logging.
 
         Returns:
@@ -105,6 +182,11 @@ def register_video_effects_tools(
         """
         _ = validate_filter_name(filter)
         validate_range(strength, 0.1, 3.0, "Filter strength")
+        if crf is not None:
+            validate_range(crf, 0, 51, "CRF")
+
+        resolved_input = str(safe_input_path(input_path))
+        resolved_output = str(safe_output_path(output_path))
 
         await log_operation(
             ctx,
@@ -112,7 +194,7 @@ def register_video_effects_tools(
         )
 
         try:
-            stream: ffmpeg.Stream = ffmpeg.input(input_path)
+            stream: ffmpeg.Stream = ffmpeg.input(resolved_input)
 
             # Apply different filters based on name
             if filter == "blur":
@@ -170,18 +252,26 @@ def register_video_effects_tools(
                     luma_amount=sharpen_amount,
                 )
             elif filter.startswith("scale="):
-                # Handle scale filter with parameters like scale=640:360
+                # Handle scale filter with parameters like scale=640:360.
+                # Force even dimensions so libx264/yuv420p does not reject odd
+                # width/height; an axis of -1 (auto) becomes -2 (auto + even).
                 scale_params = filter.split("=")[1]
                 width, height = scale_params.split(":")
                 stream = ffmpeg.filter(
                     stream,
                     "scale",
-                    str(int(width)),
-                    str(int(height)),
+                    str(_force_even(int(width))),
+                    str(_force_even(int(height))),
                 )
 
-            output: ffmpeg.Stream = create_standard_output(stream, output_path, map="0:a?")
-            _ = ffmpeg.run(output, overwrite_output=True)
+            output: ffmpeg.Stream = create_standard_output(
+                stream,
+                resolved_output,
+                crf=crf,
+                preset=preset,
+                map="0:a?",
+            )
+            await run_ffmpeg_async(output, ctx=ctx)
             return f"{filter.title()} filter applied and saved to {output_path}"
         except ffmpeg.Error as e:
             await handle_ffmpeg_error(e, ctx)
@@ -193,6 +283,8 @@ def register_video_effects_tools(
         input_path: str,
         output_path: str,
         speed: float,
+        crf: int | None = None,
+        preset: str | None = None,
         ctx: Context | None = None,
     ) -> str:
         """Change the playback speed of a video.
@@ -204,6 +296,10 @@ def register_video_effects_tools(
         automatically chaining multiple atempo filters for extreme speed changes.
         This ensures smooth audio processing at any speed within the supported range.
 
+        Silent inputs (no audio stream, e.g. Veo 2 output) are handled
+        gracefully: only the video presentation timestamps are adjusted and the
+        output is written video-only, skipping the atempo chain entirely.
+
         Args:
             input_path: Path to the input video file.
             output_path: Path where the speed-adjusted video will be saved.
@@ -211,6 +307,10 @@ def register_video_effects_tools(
                 - 0.5 = half speed (slow motion)
                 - 1.0 = normal speed (no change)
                 - 2.0 = double speed (fast forward)
+            crf: Optional libx264 Constant Rate Factor (0-51, lower is higher
+                quality). Defaults to the encoder default when omitted.
+            preset: Optional libx264 speed/quality preset (e.g. ``"ultrafast"``,
+                ``"medium"``). Defaults to the encoder default when omitted.
             ctx: MCP context for progress reporting and logging.
 
         Returns:
@@ -234,46 +334,71 @@ def register_video_effects_tools(
             raise ValueError("Speed factor must be greater than 0")
 
         validate_range(speed, 0.1, 10.0, "Speed factor")
+        if crf is not None:
+            validate_range(crf, 0, 51, "CRF")
+
+        resolved_input = str(safe_input_path(input_path))
+        resolved_output = str(safe_output_path(output_path))
+
+        # Probe up front so we know whether an audio stream exists; mapping
+        # stream["a"] on a silent source would otherwise fail with an opaque
+        # ffmpeg mapping error (H4).
+        has_audio = _has_audio_stream(resolved_input)
 
         await log_operation(
             ctx,
-            f"Changing video speed by {speed}x",
+            f"Changing video speed by {speed}x"
+            + ("" if has_audio else " (silent input, video only)"),
         )
 
         try:
-            stream: ffmpeg.Stream = ffmpeg.input(input_path)
+            stream: ffmpeg.Stream = ffmpeg.input(resolved_input)
 
-            # Apply speed change to video and audio
+            # Apply speed change to the video by scaling presentation timestamps.
             video_stream: ffmpeg.Stream = ffmpeg.filter(
                 stream["v"],
                 "setpts",
                 f"PTS/{speed}",
             )
 
-            # Handle atempo filter limitations (0.5-2.0 range)
-            # For speeds outside this range, chain multiple atempo filters
-            audio_stream: ffmpeg.Stream = stream["a"]
-            current_speed = speed
+            if not has_audio:
+                # No audio stream: write video only, skipping atempo entirely.
+                output: ffmpeg.Stream = create_standard_output(
+                    video_stream,
+                    resolved_output,
+                    crf=crf,
+                    preset=preset,
+                )
+            else:
+                # Handle atempo filter limitations (0.5-2.0 range). For speeds
+                # outside this range, chain multiple atempo filters.
+                audio_stream: ffmpeg.Stream = stream["a"]
+                current_speed = speed
 
-            while current_speed > 2.0:
-                audio_stream = ffmpeg.filter(audio_stream, "atempo", "2.0")
-                current_speed /= 2.0
+                while current_speed > 2.0:
+                    audio_stream = ffmpeg.filter(audio_stream, "atempo", "2.0")
+                    current_speed /= 2.0
 
-            while current_speed < 0.5:
-                audio_stream = ffmpeg.filter(audio_stream, "atempo", "0.5")
-                current_speed /= 0.5
+                while current_speed < 0.5:
+                    audio_stream = ffmpeg.filter(audio_stream, "atempo", "0.5")
+                    current_speed /= 0.5
 
-            if current_speed != 1.0:
-                audio_stream = ffmpeg.filter(audio_stream, "atempo", str(current_speed))
+                if current_speed != 1.0:
+                    audio_stream = ffmpeg.filter(
+                        audio_stream, "atempo", str(current_speed)
+                    )
 
-            output: ffmpeg.Stream = ffmpeg.output(
-                video_stream,
-                audio_stream,
-                output_path,
-                vcodec="libx264",
-                acodec="aac",
-            )
-            _ = ffmpeg.run(output, overwrite_output=True)
+                # Both video and audio are re-encoded. create_standard_output
+                # only maps a single stream, so build the two-stream output
+                # directly using the same encoding settings/quality controls.
+                output = ffmpeg.output(
+                    video_stream,
+                    audio_stream,
+                    resolved_output,
+                    **_speed_output_settings(crf, preset),
+                )
+
+            await run_ffmpeg_async(output, ctx=ctx)
 
             speed_desc = "faster" if speed > 1.0 else "slower"
             return (
@@ -314,10 +439,15 @@ def register_video_effects_tools(
             ValueError: If dimensions are out of valid ranges.
             RuntimeError: If ffmpeg encounters an error during processing.
         """
+        if timestamp < 0:
+            raise ValueError("Timestamp must be non-negative")
         if width is not None:
             validate_range(width, 50, 1920, "Width")
         if height is not None:
             validate_range(height, 50, 1080, "Height")
+
+        resolved_input = str(safe_input_path(input_path))
+        resolved_output = str(safe_output_path(output_path))
 
         size_desc = (
             "original size"
@@ -330,22 +460,25 @@ def register_video_effects_tools(
         )
 
         try:
-            stream: ffmpeg.Stream = ffmpeg.input(input_path, ss=timestamp)
+            stream: ffmpeg.Stream = ffmpeg.input(resolved_input, ss=timestamp)
 
             # Only apply scaling if dimensions are specified
             if width is not None or height is not None:
-                # Use -1 for auto-scaling when one dimension is not specified
-                scale_width = width if width is not None else -1
-                scale_height = height if height is not None else -1
-                stream = ffmpeg.filter(stream, "scale", str(scale_width), str(scale_height))
+                # Use -2 for the auto axis so ffmpeg preserves aspect ratio and
+                # yields an even dimension when only one axis is specified.
+                scale_width = width if width is not None else -2
+                scale_height = height if height is not None else -2
+                stream = ffmpeg.filter(
+                    stream, "scale", str(scale_width), str(scale_height)
+                )
 
-            output: ffmpeg.Stream = ffmpeg.output(stream, output_path, vframes=1)
-            _ = ffmpeg.run(output, overwrite_output=True)
+            output: ffmpeg.Stream = ffmpeg.output(stream, resolved_output, vframes=1)
+            await run_ffmpeg_async(output, ctx=ctx)
             return f"Thumbnail generated and saved to {output_path}"
         except ffmpeg.Error as e:
             await handle_ffmpeg_error(e, ctx)
             # handle_ffmpeg_error raises, but we need a return for type checking
             raise
-    
+
     # Mark decorated functions as used (they're accessed via the @mcp.tool decorator)
     _ = (apply_filter, change_speed, generate_thumbnail)

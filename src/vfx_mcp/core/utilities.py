@@ -1,33 +1,150 @@
 """Common utilities and helper functions for VFX operations."""
 
-from pathlib import Path
-from typing import TypedDict, NotRequired
+import asyncio
+import os
 from fractions import Fraction
+from pathlib import Path
+from typing import NotRequired, TypedDict
 
 import ffmpeg
 from fastmcp import Context
 
+# Maximum number of characters of ffmpeg stdout/stderr surfaced in an error
+# message. ffmpeg can emit tens of kilobytes of progress/log noise; only the
+# tail is diagnostically useful, so we keep the last ``_MAX_ERROR_CHARS``.
+_MAX_ERROR_CHARS = 4000
+
+
+def _default_max_concurrency() -> int:
+    """Read the max concurrent ffmpeg jobs from ``VFX_MAX_CONCURRENCY``."""
+    raw = os.environ.get("VFX_MAX_CONCURRENCY")
+    if not raw:
+        return 3
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return value if value >= 1 else 1
+
+
+def _default_timeout() -> float | None:
+    """Read the default ffmpeg timeout (seconds) from ``VFX_FFMPEG_TIMEOUT``.
+
+    Returns ``None`` (no timeout) when the variable is unset or unparseable.
+    """
+    raw = os.environ.get("VFX_FFMPEG_TIMEOUT")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+# Global concurrency limiter shared by every ``run_ffmpeg_async`` call so a
+# burst of MCP requests cannot spawn an unbounded number of ffmpeg processes.
+# asyncio.Semaphore construction does not require a running event loop.
+_ffmpeg_semaphore: asyncio.Semaphore = asyncio.Semaphore(_default_max_concurrency())
+
+
+def _truncate_tail(text: str, max_chars: int = _MAX_ERROR_CHARS) -> str:
+    """Keep only the last ``max_chars`` characters of ``text``.
+
+    The tail of ffmpeg output holds the actual error, so we trim from the
+    front and align the cut to a line boundary when possible.
+    """
+    if len(text) <= max_chars:
+        return text
+    tail = text[-max_chars:]
+    newline = tail.find("\n")
+    if newline != -1:
+        tail = tail[newline + 1 :]
+    return f"...[truncated {len(text) - len(tail)} chars]...\n{tail}"
+
+
+def _decode(raw: bytes | None) -> str:
+    """Best-effort UTF-8 decode of ffmpeg stdout/stderr bytes."""
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return str(raw)
+
 
 async def handle_ffmpeg_error(e: ffmpeg.Error, ctx: Context | None = None) -> None:
-    """Standard error handling for ffmpeg operations."""
-    stderr_msg = ""
-    if e.stderr:
-        try:
-            stderr_msg = e.stderr.decode("utf-8")
-        except Exception:
-            stderr_msg = str(e.stderr)
+    """Standard error handling for ffmpeg operations.
 
-    stdout_msg = ""
-    if e.stdout:
-        try:
-            stdout_msg = e.stdout.decode("utf-8")
-        except Exception:
-            stdout_msg = str(e.stdout)
+    Decodes the captured stdout/stderr, truncates it to a sane tail so huge
+    ffmpeg logs do not flood MCP responses, logs it via the context, and
+    re-raises as a :class:`RuntimeError`. This function always raises.
+    """
+    stderr_msg = _truncate_tail(_decode(e.stderr))
+    stdout_msg = _truncate_tail(_decode(e.stdout))
 
     error_msg = f"FFmpeg error: {stderr_msg or stdout_msg or str(e)}"
     if ctx:
         await ctx.error(error_msg)
     raise RuntimeError(error_msg) from e
+
+
+async def run_ffmpeg_async(
+    output_stream: ffmpeg.Stream,
+    *,
+    timeout: float | None = None,
+    ctx: Context | None = None,
+) -> None:
+    """Run an ffmpeg output stream without blocking the event loop.
+
+    The blocking ffmpeg subprocess is launched in a worker thread (via
+    :func:`asyncio.to_thread`) while a module-level semaphore caps the number
+    of concurrent encodes (``VFX_MAX_CONCURRENCY``, default 3). Output is
+    always overwritten and stdout/stderr are captured so that failures can be
+    translated through :func:`handle_ffmpeg_error`.
+
+    Args:
+        output_stream: A configured ffmpeg output node (e.g. from
+            :func:`create_standard_output`).
+        timeout: Maximum seconds to allow the encode to run. When ``None``
+            the default from ``VFX_FFMPEG_TIMEOUT`` is used (or no timeout at
+            all when that is unset). On timeout the process is killed and a
+            :class:`RuntimeError` is raised.
+        ctx: Optional MCP context for error reporting.
+
+    Raises:
+        RuntimeError: On ffmpeg failure (non-zero exit) or timeout.
+    """
+    effective_timeout = timeout if timeout is not None else _default_timeout()
+
+    async with _ffmpeg_semaphore:
+        process = await asyncio.to_thread(
+            ffmpeg.run_async,
+            output_stream,
+            pipe_stdout=True,
+            pipe_stderr=True,
+            overwrite_output=True,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                asyncio.to_thread(process.communicate),
+                timeout=effective_timeout,
+            )
+        except TimeoutError:
+            process.kill()
+            await asyncio.to_thread(process.wait)
+            error_msg = (
+                f"FFmpeg operation timed out after {effective_timeout} seconds "
+                "and was killed."
+            )
+            if ctx:
+                await ctx.error(error_msg)
+            raise RuntimeError(error_msg) from None
+
+        retcode = process.poll()
+        if retcode:
+            error = ffmpeg.Error("ffmpeg", stdout, stderr)
+            await handle_ffmpeg_error(error, ctx)
 
 
 async def log_operation(ctx: Context | None, message: str) -> None:
@@ -38,6 +155,7 @@ async def log_operation(ctx: Context | None, message: str) -> None:
 
 class VideoStreamMetadata(TypedDict):
     """Video stream metadata."""
+
     codec: str
     width: int
     height: int
@@ -48,6 +166,7 @@ class VideoStreamMetadata(TypedDict):
 
 class AudioStreamMetadata(TypedDict):
     """Audio stream metadata."""
+
     codec: str
     channels: int
     sample_rate: int
@@ -56,6 +175,7 @@ class AudioStreamMetadata(TypedDict):
 
 class VideoMetadata(TypedDict):
     """Video metadata structure."""
+
     filename: str
     format: str
     duration: float
@@ -117,17 +237,74 @@ def get_video_metadata(
         raise RuntimeError(f"Error analyzing video: {e}") from e
 
 
-def create_standard_output(stream: ffmpeg.Stream, output_path: str, **kwargs: str | int | float) -> ffmpeg.Stream:
-    """Create ffmpeg output with standard encoding settings."""
-    default_settings: dict[str, str | int | float] = {
-        "vcodec": "libx264",
-        "acodec": "aac",
-        "pix_fmt": "yuv420p",
-    }
-    # Merge kwargs into default_settings
-    for key, value in kwargs.items():
-        default_settings[key] = value
-    return ffmpeg.output(stream, output_path, **default_settings)
+def create_standard_output(
+    stream: ffmpeg.Stream,
+    output_path: str,
+    *,
+    crf: int | None = None,
+    preset: str | None = None,
+    video_bitrate: str | None = None,
+    audio_bitrate: str | None = None,
+    copy_video: bool = False,
+    copy_audio: bool = False,
+    faststart: bool = False,
+    **kwargs: str | int | float,
+) -> ffmpeg.Stream:
+    """Create an ffmpeg output node with standard encoding settings.
+
+    Defaults produce an H.264 (``libx264``) / AAC / ``yuv420p`` MP4-friendly
+    stream, matching the historical behaviour. Quality can be tuned per-call
+    and either stream can be stream-copied to avoid re-encoding.
+
+    Args:
+        stream: The ffmpeg stream to encode.
+        output_path: Destination file path.
+        crf: Constant Rate Factor for libx264 (lower = higher quality).
+            Ignored when ``copy_video`` is True.
+        preset: libx264 speed/quality preset (e.g. ``"ultrafast"``,
+            ``"medium"``). Ignored when ``copy_video`` is True.
+        video_bitrate: Target video bitrate (e.g. ``"2M"``). Ignored when
+            ``copy_video`` is True.
+        audio_bitrate: Target audio bitrate (e.g. ``"128k"``). Ignored when
+            ``copy_audio`` is True.
+        copy_video: Stream-copy the video (``vcodec="copy"``, no ``pix_fmt``)
+            for a lossless, near-instant pass-through.
+        copy_audio: Stream-copy the audio (``acodec="copy"``).
+        faststart: Add ``-movflags +faststart`` (relocates the moov atom for
+            progressive playback of MP4/MOV deliverables).
+        **kwargs: Extra ffmpeg output options passed through verbatim and
+            overriding any of the above (e.g. ``map="0:a?"``).
+
+    Returns:
+        The configured ffmpeg output node.
+    """
+    settings: dict[str, str | int | float] = {}
+
+    if copy_video:
+        settings["vcodec"] = "copy"
+    else:
+        settings["vcodec"] = "libx264"
+        settings["pix_fmt"] = "yuv420p"
+        if crf is not None:
+            settings["crf"] = crf
+        if preset is not None:
+            settings["preset"] = preset
+        if video_bitrate is not None:
+            settings["video_bitrate"] = video_bitrate
+
+    if copy_audio:
+        settings["acodec"] = "copy"
+    else:
+        settings["acodec"] = "aac"
+        if audio_bitrate is not None:
+            settings["audio_bitrate"] = audio_bitrate
+
+    if faststart:
+        settings["movflags"] = "+faststart"
+
+    # Caller-provided kwargs win over the computed defaults.
+    settings.update(kwargs)
+    return ffmpeg.output(stream, output_path, **settings)
 
 
 COLOR_MAP = {
