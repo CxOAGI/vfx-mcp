@@ -10,29 +10,30 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import ffmpeg
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import FastMCPTransport
+from mcp.shared.exceptions import McpError
 
 if TYPE_CHECKING:
-    from typing import TypedDict, NotRequired
-    
+    from typing import NotRequired, TypedDict
+
     class VideoInfo(TypedDict):
         width: int
         height: int
         codec: str
         framerate: NotRequired[str]
         bitrate: NotRequired[str]
-    
+
     class AudioInfo(TypedDict):
         codec: str
         sample_rate: NotRequired[str]
         channels: NotRequired[int]
         bitrate: NotRequired[str]
-    
+
     class VideoMetadata(TypedDict):
         filename: str
         duration: float
@@ -40,10 +41,25 @@ if TYPE_CHECKING:
         audio: NotRequired[AudioInfo]
         size: NotRequired[int]
         format: NotRequired[str]
-    
+
     class VideoList(TypedDict):
         videos: list[str]
         count: NotRequired[int]
+
+
+def _make_video(path: Path, *, duration: int = 1, size: str = "320x240") -> Path:
+    """Generate a small real video at ``path`` for probe-backed tests."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = (
+        ffmpeg.input(
+            f"testsrc=duration={duration}:size={size}:rate=24",
+            f="lavfi",
+        )
+        .output(str(path), vcodec="libx264", preset="ultrafast", **{"f": "mp4"})
+        .overwrite_output()
+    )
+    ffmpeg.run(stream, quiet=True)
+    return path
 
 
 class TestMCPResourcesE2E:
@@ -68,8 +84,8 @@ class TestMCPResourcesE2E:
                 # Step 1: List videos using resource endpoint
                 list_result = await client.read_resource("videos://list")
                 # Resource should be text for JSON responses
-                assert hasattr(list_result[0], 'text'), "Expected text resource"
-                video_list = cast('VideoList', json.loads(list_result[0].text))
+                assert hasattr(list_result[0], "text"), "Expected text resource"
+                video_list = cast("VideoList", json.loads(list_result[0].text))
 
                 assert "videos" in video_list
                 assert len(video_list["videos"]) == len(sample_videos)
@@ -80,7 +96,9 @@ class TestMCPResourcesE2E:
                     metadata_result = await client.read_resource(
                         f"videos://{video_filename}/metadata"
                     )
-                    metadata = cast('VideoMetadata', json.loads(metadata_result[0].text))
+                    metadata = cast(
+                        "VideoMetadata", json.loads(metadata_result[0].text)
+                    )
                     video_metadata.append(metadata)
 
                 # Verify metadata structure
@@ -114,7 +132,9 @@ class TestMCPResourcesE2E:
             os.chdir(original_cwd)
 
     @pytest.mark.integration
-    async def test_resource_discovery_workflow(self, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_resource_discovery_workflow(
+        self, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test comprehensive resource discovery and processing workflow.
 
         This test creates multiple videos with different properties,
@@ -131,14 +151,14 @@ class TestMCPResourcesE2E:
         for spec in video_specs:
             video_path = temp_dir / str(spec["name"])
             ffmpeg.input(
-                    f"testsrc=duration={spec['duration']}:size={spec['size']}:rate=24",
-                    f="lavfi",
-                ).output(
-                    str(video_path),
-                    vcodec="libx264",
-                    preset="ultrafast",
-                    **{"f": "mp4"},
-                ).overwrite_output().run(quiet=True)
+                f"testsrc=duration={spec['duration']}:size={spec['size']}:rate=24",
+                f="lavfi",
+            ).output(
+                str(video_path),
+                vcodec="libx264",
+                preset="ultrafast",
+                **{"f": "mp4"},
+            ).overwrite_output().run(quiet=True)
             created_videos.append(video_path)
 
         # Change to temp directory for resource discovery
@@ -151,16 +171,16 @@ class TestMCPResourcesE2E:
                 # Step 1: Discover all videos
                 list_result = await client.read_resource("videos://list")
                 # Resource should be text for JSON responses
-                assert hasattr(list_result[0], 'text'), "Expected text resource"
-                video_list = cast('VideoList', json.loads(list_result[0].text))
+                assert hasattr(list_result[0], "text"), "Expected text resource"
+                video_list = cast("VideoList", json.loads(list_result[0].text))
 
                 assert "videos" in video_list
                 assert len(video_list["videos"]) == len(video_specs)
 
                 # Step 2: Analyze each video and categorize
-                short_videos: list[tuple[str, 'VideoMetadata']] = []
-                medium_videos: list[tuple[str, 'VideoMetadata']] = []
-                long_videos: list[tuple[str, 'VideoMetadata']] = []
+                short_videos: list[tuple[str, VideoMetadata]] = []
+                medium_videos: list[tuple[str, VideoMetadata]] = []
+                long_videos: list[tuple[str, VideoMetadata]] = []
 
                 for video_filename in video_list["videos"]:
                     metadata_result = await client.read_resource(
@@ -263,7 +283,9 @@ class TestMCPResourcesE2E:
             os.chdir(original_cwd)
 
     @pytest.mark.integration
-    async def test_metadata_driven_processing(self, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_metadata_driven_processing(
+        self, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test processing videos based on their metadata properties.
 
         This test discovers video metadata and makes processing decisions
@@ -293,15 +315,19 @@ class TestMCPResourcesE2E:
 
         for spec in test_videos:
             video_path = temp_dir / str(spec["name"])
-            stream = ffmpeg.input(
+            stream = (
+                ffmpeg.input(
                     f"testsrc=duration={spec['duration']}:size={spec['size']}:rate={spec['rate']}",
                     f="lavfi",
-                ).output(
+                )
+                .output(
                     str(video_path),
                     vcodec="libx264",
                     preset="ultrafast",
                     **{"f": "mp4"},
-                ).overwrite_output()
+                )
+                .overwrite_output()
+            )
             ffmpeg.run(stream, quiet=True)
 
         original_cwd = os.getcwd()
@@ -313,8 +339,8 @@ class TestMCPResourcesE2E:
                 # Discover and analyze all videos
                 list_result = await client.read_resource("videos://list")
                 # Resource should be text for JSON responses
-                assert hasattr(list_result[0], 'text'), "Expected text resource"
-                video_list = cast('VideoList', json.loads(list_result[0].text))
+                assert hasattr(list_result[0], "text"), "Expected text resource"
+                video_list = cast("VideoList", json.loads(list_result[0].text))
 
                 for video_filename in video_list["videos"]:
                     metadata_result = await client.read_resource(
@@ -417,7 +443,9 @@ class TestMCPResourcesE2E:
             os.chdir(original_cwd)
 
     @pytest.mark.integration
-    async def test_batch_processing_via_resources(self, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_batch_processing_via_resources(
+        self, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test batch processing of videos discovered via resources.
 
         This test simulates a batch processing scenario where multiple
@@ -432,15 +460,19 @@ class TestMCPResourcesE2E:
             duration = 2 + (i * 0.5)  # Varying durations
             size = ["320x240", "640x480", "1280x720"][i % 3]  # Varying sizes
 
-            stream = ffmpeg.input(
+            stream = (
+                ffmpeg.input(
                     f"testsrc=duration={duration}:size={size}:rate=24",
                     f="lavfi",
-                ).output(
+                )
+                .output(
                     str(video_path),
                     vcodec="libx264",
                     preset="ultrafast",
                     **{"f": "mp4"},
-                ).overwrite_output()
+                )
+                .overwrite_output()
+            )
             ffmpeg.run(stream, quiet=True)
             batch_videos.append(video_path)
 
@@ -453,8 +485,8 @@ class TestMCPResourcesE2E:
                 # Step 1: Discover all videos
                 list_result = await client.read_resource("videos://list")
                 # Resource should be text for JSON responses
-                assert hasattr(list_result[0], 'text'), "Expected text resource"
-                video_list = cast('VideoList', json.loads(list_result[0].text))
+                assert hasattr(list_result[0], "text"), "Expected text resource"
+                video_list = cast("VideoList", json.loads(list_result[0].text))
 
                 # Filter for batch videos only
                 batch_filenames = [
@@ -557,7 +589,9 @@ class TestMCPResourcesE2E:
             os.chdir(original_cwd)
 
     @pytest.mark.integration
-    async def test_resource_error_handling(self, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_resource_error_handling(
+        self, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test error handling for MCP resources.
 
         This test verifies that resource endpoints handle errors correctly
@@ -576,14 +610,14 @@ class TestMCPResourcesE2E:
                 # Test listing videos in empty directory
                 list_result = await client.read_resource("videos://list")
                 # Resource should be text for JSON responses
-                assert hasattr(list_result[0], 'text'), "Expected text resource"
-                video_list = cast('VideoList', json.loads(list_result[0].text))
+                assert hasattr(list_result[0], "text"), "Expected text resource"
+                video_list = cast("VideoList", json.loads(list_result[0].text))
 
                 assert "videos" in video_list
                 assert len(video_list["videos"]) == 0
 
                 # Test metadata for non-existent file
-                with pytest.raises((FileNotFoundError, RuntimeError)):
+                with pytest.raises(McpError):
                     await client.read_resource("videos://nonexistent.mp4/metadata")
 
         finally:
@@ -600,7 +634,11 @@ class TestMCPResourcesE2E:
         """
         # Copy sample video to temp directory
         test_video = temp_dir / "test_consistency.mp4"
-        stream = ffmpeg.input(str(sample_video)).output(str(test_video), c="copy").overwrite_output()
+        stream = (
+            ffmpeg.input(str(sample_video))
+            .output(str(test_video), c="copy")
+            .overwrite_output()
+        )
         ffmpeg.run(stream, quiet=True)
 
         original_cwd = os.getcwd()
@@ -613,14 +651,16 @@ class TestMCPResourcesE2E:
                 resource_result = await client.read_resource(
                     f"videos://{test_video.name}/metadata"
                 )
-                resource_metadata = cast(VideoMetadata, json.loads(resource_result[0].text))
+                resource_metadata = cast(
+                    "VideoMetadata", json.loads(resource_result[0].text)
+                )
 
                 # Get metadata via tool
                 tool_result = await client.call_tool(
                     "get_video_info",
                     {"video_path": test_video.name},
                 )
-                tool_metadata = cast(VideoMetadata, json.loads(tool_result[0].text))
+                tool_metadata = cast("VideoMetadata", json.loads(tool_result[0].text))
 
                 # Compare metadata consistency
                 assert resource_metadata["filename"] == tool_metadata["filename"]
@@ -675,7 +715,9 @@ class TestMCPResourcesE2E:
                 processed_metadata_result = await client.read_resource(
                     f"videos://{processed_video.name}/metadata"
                 )
-                processed_metadata = cast(VideoMetadata, json.loads(processed_metadata_result[0].text))
+                processed_metadata = cast(
+                    "VideoMetadata", json.loads(processed_metadata_result[0].text)
+                )
 
                 # Verify dimensions changed correctly
                 expected_width = int(resource_metadata["video"]["width"] * 0.75)
@@ -702,15 +744,19 @@ class TestMCPResourcesE2E:
             video_path = temp_dir / f"many_{i:03d}.mp4"
             duration = 1 + (i % 3)  # 1-3 second videos
 
-            stream = ffmpeg.input(
+            stream = (
+                ffmpeg.input(
                     f"testsrc=duration={duration}:size=320x240:rate=24",
                     f="lavfi",
-                ).output(
+                )
+                .output(
                     str(video_path),
                     vcodec="libx264",
                     preset="ultrafast",
                     **{"f": "mp4"},
-                ).overwrite_output()
+                )
+                .overwrite_output()
+            )
             ffmpeg.run(stream, quiet=True)
             created_videos.append(video_path)
 
@@ -765,3 +811,142 @@ class TestMCPResourcesE2E:
 
         finally:
             os.chdir(original_cwd)
+
+
+class TestMCPResourcesWorkspaceScoping:
+    """Tests for workspace-scoped resource behavior (H7 + metadata sandbox)."""
+
+    @pytest.mark.integration
+    async def test_list_returns_workspace_relative_paths(
+        self,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """videos://list returns workspace-relative paths plus a count.
+
+        Files in nested (bounded-depth) directories are reported with their
+        relative path, hidden files/dirs and non-video files are excluded, and
+        the ``count`` field reflects the total number of matches.
+        """
+        workspace = temp_dir / "workspace"
+        (workspace / "sub").mkdir(parents=True)
+        (workspace / "hidden_dir").mkdir()
+
+        (workspace / "root.mp4").write_text("v")
+        (workspace / "sub" / "nested.mov").write_text("v")
+        (workspace / "notes.txt").write_text("not a video")
+        (workspace / ".hidden.mp4").write_text("hidden")
+        (workspace / "hidden_dir").joinpath("skip.mp4").write_text("v")
+        os.rename(
+            workspace / "hidden_dir", workspace / ".hidden_dir"
+        )  # make the dir hidden after creating its file
+
+        monkeypatch.setenv("VFX_WORKSPACE", str(workspace))
+
+        client: Client[FastMCPTransport] = Client(mcp_server)
+        async with client:
+            list_result = await client.read_resource("videos://list")
+            assert hasattr(list_result[0], "text"), "Expected text resource"
+            video_list = json.loads(list_result[0].text)
+
+        found = set(video_list["videos"])
+        # Relative POSIX paths, usable directly as tool input_path.
+        assert found == {"root.mp4", "sub/nested.mov"}
+        assert video_list["count"] == 2
+        # No absolute paths, no bare filenames for nested files.
+        assert all(not p.startswith("/") for p in found)
+        assert "notes.txt" not in found
+        assert ".hidden.mp4" not in found
+
+    @pytest.mark.integration
+    async def test_list_excludes_files_outside_workspace(
+        self,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """videos://list never reports files above the workspace root."""
+        workspace = temp_dir / "ws"
+        workspace.mkdir()
+        (workspace / "inside.mp4").write_text("v")
+        # A video sitting in the parent (outside the sandbox) must not appear.
+        (temp_dir / "outside.mp4").write_text("v")
+
+        monkeypatch.setenv("VFX_WORKSPACE", str(workspace))
+
+        client: Client[FastMCPTransport] = Client(mcp_server)
+        async with client:
+            list_result = await client.read_resource("videos://list")
+            video_list = json.loads(list_result[0].text)
+
+        assert video_list["videos"] == ["inside.mp4"]
+        assert video_list["count"] == 1
+
+    @pytest.mark.integration
+    async def test_metadata_scoped_to_workspace(
+        self,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Metadata resolves within the workspace and rejects escapes.
+
+        A real video inside a nested workspace directory is probed via its
+        relative path, while a file that exists only in the parent directory
+        (outside the sandbox) is not reachable.
+        """
+        workspace = temp_dir / "ws"
+        _make_video(workspace / "sub" / "clip.mp4")
+        # A real, probe-able video outside the sandbox.
+        _make_video(temp_dir / "secret.mp4")
+
+        monkeypatch.setenv("VFX_WORKSPACE", str(workspace))
+        monkeypatch.delenv("VFX_ALLOW_ABSOLUTE", raising=False)
+
+        client: Client[FastMCPTransport] = Client(mcp_server)
+        async with client:
+            # In-workspace nested path works. The slash is percent-encoded so
+            # the whole relative path lands in the single ``{filename}`` URI
+            # template variable (a raw slash would be read as an extra path
+            # segment and fail to route).
+            meta_result = await client.read_resource("videos://sub%2Fclip.mp4/metadata")
+            metadata = json.loads(meta_result[0].text)
+            assert metadata["filename"] == "clip.mp4"
+            assert metadata["video"]["width"] == 320
+
+            # A file that only exists in the parent dir is not reachable:
+            # "secret.mp4" resolves inside the sandbox where it does not exist.
+            with pytest.raises(McpError):
+                await client.read_resource("videos://secret.mp4/metadata")
+
+    @pytest.mark.integration
+    async def test_advanced_tools_resource_is_accurate(
+        self, mcp_server: FastMCP[None]
+    ) -> None:
+        """tools://advanced reflects tools that actually exist (M2)."""
+        client: Client[FastMCPTransport] = Client(mcp_server)
+        async with client:
+            registered = {tool.name for tool in await client.list_tools()}
+
+            all_result = await client.read_resource("tools://advanced/all")
+            payload = json.loads(all_result[0].text)
+
+            names = {tool["name"] for tool in payload["advanced_tools"]}
+            # Stale/non-existent advertised tool must be gone.
+            assert "create_video_slideshow" not in names
+            # Every advertised tool must actually exist on the server (M2).
+            phantom = names - registered
+            assert names <= registered, f"phantom tools advertised: {phantom}"
+            # Real tools registered by the server are advertised.
+            assert "stitch_with_transitions" in names
+            assert "normalize_loudness" in names
+            assert "concatenate_videos" in names
+
+            # Category filtering returns only that category's tools.
+            stitch_result = await client.read_resource("tools://advanced/stitching")
+            stitch_payload = json.loads(stitch_result[0].text)
+            stitch_names = {tool["name"] for tool in stitch_payload["advanced_tools"]}
+            assert "stitch_with_transitions" in stitch_names
+            assert "create_green_screen_effect" not in stitch_names
+            assert stitch_payload["category"] == "stitching"

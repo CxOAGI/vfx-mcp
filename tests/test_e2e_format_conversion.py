@@ -19,11 +19,119 @@ if TYPE_CHECKING:
     pass
 
 
+@pytest.fixture(autouse=True)
+def _allow_absolute_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit absolute (temp-dir) paths through the workspace sandbox.
+
+    The tools now validate every path with ``safe_input_path`` /
+    ``safe_output_path``, which reject absolute paths outside the workspace
+    unless ``VFX_ALLOW_ABSOLUTE=1``. The test fixtures live in per-test temp
+    directories, so this fixture opts the whole module into absolute paths.
+    """
+    monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+
+
+def _moov_precedes_mdat(mp4_path: Path) -> bool:
+    """Return True if the MP4's ``moov`` atom appears before ``mdat``.
+
+    ``-movflags +faststart`` relocates the ``moov`` atom ahead of the media
+    data (``mdat``) so the file can start playing before it is fully
+    downloaded. Checking atom ordering in the raw bytes is a muxer-independent
+    way to confirm faststart was applied, without needing to parse ffprobe
+    output.
+    """
+    data = mp4_path.read_bytes()
+    moov_index = data.find(b"moov")
+    mdat_index = data.find(b"mdat")
+    return moov_index != -1 and mdat_index != -1 and moov_index < mdat_index
+
+
 class TestFormatConversionE2E:
     """End-to-end tests for format conversion operations."""
 
     @pytest.mark.integration
-    async def test_format_conversion_workflow(self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_explicit_codec_overrides_format_default(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Explicit video/audio codecs must win over the ``format`` default.
+
+        Regression test for M4: passing ``format="mp4"`` used to silently
+        force libx264/aac, clobbering any explicit codec choice. An explicit
+        ``video_codec="libx265"`` (and ``audio_codec="mp3"``) must be honored
+        even though the mp4 format default is libx264/aac.
+        """
+        output_path = temp_dir / "explicit_codec.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "convert_format",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(output_path),
+                    "format": "mp4",
+                    "video_codec": "libx265",
+                    "audio_codec": "mp3",
+                    "video_bitrate": "1M",
+                    "audio_bitrate": "128k",
+                },
+            )
+            assert output_path.exists()
+
+            probe = ffmpeg.probe(str(output_path))
+            video_stream = next(
+                s for s in probe["streams"] if s["codec_type"] == "video"
+            )
+            audio_stream = next(
+                s for s in probe["streams"] if s["codec_type"] == "audio"
+            )
+
+            # Explicit codecs win despite format="mp4" defaulting to libx264/aac
+            assert video_stream["codec_name"] == "hevc"
+            assert audio_stream["codec_name"] == "mp3"
+
+    @pytest.mark.integration
+    async def test_mp4_output_has_faststart(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """MP4/MOV deliverables must be written with ``-movflags +faststart``.
+
+        Regression test for M1: mp4 outputs should relocate the ``moov`` atom
+        ahead of ``mdat`` for progressive playback. This is asserted both when
+        the mp4 container is inferred from the output extension and when it is
+        requested via the explicit ``format`` argument.
+        """
+        async with Client(mcp_server) as client:
+            # 1) faststart inferred from the .mp4 output extension
+            by_extension = temp_dir / "faststart_by_ext.mp4"
+            await client.call_tool(
+                "convert_format",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(by_extension),
+                    "video_codec": "libx264",
+                    "audio_codec": "aac",
+                },
+            )
+            assert by_extension.exists()
+            assert _moov_precedes_mdat(by_extension)
+
+            # 2) faststart selected via the explicit format argument
+            by_format = temp_dir / "faststart_by_format.mp4"
+            await client.call_tool(
+                "convert_format",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(by_format),
+                    "format": "mp4",
+                },
+            )
+            assert by_format.exists()
+            assert _moov_precedes_mdat(by_format)
+
+    @pytest.mark.integration
+    async def test_format_conversion_workflow(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test converting between different video formats and codecs.
 
         This test converts a video to different formats and verifies
@@ -395,7 +503,7 @@ class TestFormatConversionE2E:
             add_result = await client.call_tool(
                 "add_audio",
                 {
-                    "video_path": str(silent_video_path),
+                    "input_path": str(silent_video_path),
                     "audio_path": str(audio_path),
                     "output_path": str(video_with_audio),
                     "replace": True,
@@ -483,7 +591,9 @@ class TestFormatConversionE2E:
                 assert video_stream["height"] == 720
 
     @pytest.mark.integration
-    async def test_conversion_error_handling(self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_conversion_error_handling(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test error handling in format conversion operations.
 
         This test verifies that format conversion tools handle errors

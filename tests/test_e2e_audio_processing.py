@@ -1,8 +1,11 @@
 """End-to-end tests for audio processing operations.
 
 This module provides comprehensive end-to-end testing for audio processing
-tools including extract_audio and add_audio. Tests cover realistic workflows
-and complete operations from input to output validation.
+tools including extract_audio, add_audio, volume/fade effects, mixing, and
+loudness normalization. Tests cover realistic workflows and complete
+operations from input to output validation, including that "replace" really
+replaces (single audio track) and that video-preserving tools keep the video
+stream.
 """
 
 from __future__ import annotations
@@ -19,12 +22,37 @@ if TYPE_CHECKING:
     pass
 
 
+@pytest.fixture(autouse=True)
+def _allow_absolute_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit absolute (temp-dir) paths through the workspace sandbox.
+
+    The audio tools validate every path with ``safe_input_path`` /
+    ``safe_output_path``, which reject absolute paths outside the workspace
+    unless ``VFX_ALLOW_ABSOLUTE=1``. The test fixtures live in per-test temp
+    directories, so this fixture opts the whole module into absolute paths.
+    """
+    monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+
+
+def _stream_counts(media_path: Path) -> tuple[int, int]:
+    """Return the ``(video_count, audio_count)`` for a media file."""
+    probe = ffmpeg.probe(str(media_path))
+    streams = probe["streams"]
+    video = sum(1 for s in streams if s["codec_type"] == "video")
+    audio = sum(1 for s in streams if s["codec_type"] == "audio")
+    return video, audio
+
+
 class TestAudioProcessingE2E:
     """End-to-end tests for audio processing operations."""
 
     @pytest.mark.integration
     async def test_complete_audio_workflow(
-        self, sample_video: Path, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+        self,
+        sample_video: Path,
+        sample_audio: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
     ) -> None:
         """Test a complete audio processing workflow.
 
@@ -60,7 +88,7 @@ class TestAudioProcessingE2E:
             _ = await client.call_tool(
                 "add_audio",
                 {
-                    "video_path": str(sample_video),
+                    "input_path": str(sample_video),
                     "audio_path": str(sample_audio),
                     "output_path": str(video_with_new_audio),
                     "replace": True,
@@ -74,7 +102,7 @@ class TestAudioProcessingE2E:
             _ = await client.call_tool(
                 "add_audio",
                 {
-                    "video_path": str(sample_video),
+                    "input_path": str(sample_video),
                     "audio_path": str(sample_audio),
                     "output_path": str(video_mixed_audio),
                     "replace": False,
@@ -83,19 +111,81 @@ class TestAudioProcessingE2E:
             )
             assert video_mixed_audio.exists()
 
-            # Step 4: Verify both outputs have video and audio
+            # Step 4: Verify both outputs have exactly one video and one audio
+            # stream. In particular "replace" must not leave the original audio
+            # behind (a second audio track).
             for video_path in [video_with_new_audio, video_mixed_audio]:
-                probe = ffmpeg.probe(str(video_path))
-                video_stream = next(
-                    (s for s in probe["streams"] if s["codec_type"] == "video"),
-                    None,
+                video_count, audio_count = _stream_counts(video_path)
+                assert video_count == 1
+                assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_add_audio_replace_produces_single_track(
+        self,
+        sample_video: Path,
+        sample_audio: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Replace mode must drop the original audio (single audio stream).
+
+        The input video already carries a 440Hz sine track. After replacing
+        the audio, the output must contain exactly one audio stream (the new
+        one) and one video stream, not two audio tracks.
+        """
+        async with Client(mcp_server) as client:
+            output_path = temp_dir / "replaced_single_track.mp4"
+            _ = await client.call_tool(
+                "add_audio",
+                {
+                    "input_path": str(sample_video),
+                    "audio_path": str(sample_audio),
+                    "output_path": str(output_path),
+                    "replace": True,
+                    "audio_volume": 1.0,
+                },
+            )
+            assert output_path.exists()
+
+            video_count, audio_count = _stream_counts(output_path)
+            assert video_count == 1
+            assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_add_audio_to_silent_video(
+        self,
+        sample_videos_silent: list[Path],
+        sample_audio: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Adding audio to a silent video should produce a single audio track.
+
+        Silent clips (no original audio) can be given a soundtrack in either
+        replace or mix mode; mix gracefully falls back to using the new audio
+        alone since there is nothing to mix with.
+        """
+        silent_video = sample_videos_silent[0]
+        async with Client(mcp_server) as client:
+            for replace, name in (
+                (True, "silent_replace.mp4"),
+                (False, "silent_mix.mp4"),
+            ):
+                output_path = temp_dir / name
+                _ = await client.call_tool(
+                    "add_audio",
+                    {
+                        "input_path": str(silent_video),
+                        "audio_path": str(sample_audio),
+                        "output_path": str(output_path),
+                        "replace": replace,
+                        "audio_volume": 1.0,
+                    },
                 )
-                audio_stream = next(
-                    (s for s in probe["streams"] if s["codec_type"] == "audio"),
-                    None,
-                )
-                assert video_stream is not None
-                assert audio_stream is not None
+                assert output_path.exists()
+                video_count, audio_count = _stream_counts(output_path)
+                assert video_count == 1
+                assert audio_count == 1
 
     @pytest.mark.integration
     async def test_audio_format_conversion_workflow(
@@ -151,8 +241,35 @@ class TestAudioProcessingE2E:
                     assert audio_stream["codec_name"] == "flac"
 
     @pytest.mark.integration
+    async def test_extract_audio_no_audio_stream(
+        self,
+        sample_videos_silent: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Extracting audio from a silent video must raise a clear error.
+
+        Silent Veo-2-style clips have no audio stream; extraction should fail
+        with a meaningful error rather than an opaque ffmpeg mapping crash.
+        """
+        async with Client(mcp_server) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "extract_audio",
+                    {
+                        "input_path": str(sample_videos_silent[0]),
+                        "output_path": str(temp_dir / "silent_audio.mp3"),
+                        "format": "mp3",
+                    },
+                )
+
+    @pytest.mark.integration
     async def test_audio_volume_adjustment_workflow(
-        self, sample_video: Path, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+        self,
+        sample_video: Path,
+        sample_audio: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
     ) -> None:
         """Test audio volume adjustments in various scenarios.
 
@@ -171,10 +288,10 @@ class TestAudioProcessingE2E:
                 output_path = temp_dir / output_name
                 replace_mode = mode == "replace"
 
-                result = await client.call_tool(
+                _ = await client.call_tool(
                     "add_audio",
                     {
-                        "video_path": str(sample_video),
+                        "input_path": str(sample_video),
                         "audio_path": str(sample_audio),
                         "output_path": str(output_path),
                         "replace": replace_mode,
@@ -183,26 +300,207 @@ class TestAudioProcessingE2E:
                 )
                 assert output_path.exists()
 
-                # Verify video and audio streams exist
+                # Verify a single video and single audio stream exist.
+                video_count, audio_count = _stream_counts(output_path)
+                assert video_count == 1
+                assert audio_count == 1
+
                 probe = ffmpeg.probe(str(output_path))
                 video_stream = next(
-                    (s for s in probe["streams"] if s["codec_type"] == "video"),
-                    None,
+                    s for s in probe["streams"] if s["codec_type"] == "video"
                 )
-                audio_stream = next(
-                    (s for s in probe["streams"] if s["codec_type"] == "audio"),
-                    None,
-                )
-                assert video_stream is not None
-                assert audio_stream is not None
 
                 # Verify video properties remain unchanged
                 assert video_stream["width"] == 1280
                 assert video_stream["height"] == 720
 
     @pytest.mark.integration
+    async def test_adjust_audio_volume_preserves_video(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """adjust_audio_volume on a video must keep the video stream."""
+        async with Client(mcp_server) as client:
+            output_path = temp_dir / "louder_video.mp4"
+            _ = await client.call_tool(
+                "adjust_audio_volume",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(output_path),
+                    "volume": 1.5,
+                },
+            )
+            assert output_path.exists()
+            video_count, audio_count = _stream_counts(output_path)
+            assert video_count == 1
+            assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_adjust_audio_volume_audio_only(
+        self, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """adjust_audio_volume on an audio-only file stays audio-only."""
+        async with Client(mcp_server) as client:
+            output_path = temp_dir / "louder_audio.mp3"
+            _ = await client.call_tool(
+                "adjust_audio_volume",
+                {
+                    "input_path": str(sample_audio),
+                    "output_path": str(output_path),
+                    "volume": 1.5,
+                },
+            )
+            assert output_path.exists()
+            video_count, audio_count = _stream_counts(output_path)
+            assert video_count == 0
+            assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_audio_fade_preserves_video(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Fade-in/out on a video must preserve the video stream.
+
+        Regression test for the bug where fade tools mapped only the filtered
+        audio, producing an audio-only ".mp4" with no video stream.
+        """
+        async with Client(mcp_server) as client:
+            for tool_name, name in (
+                ("audio_fade_in", "faded_in.mp4"),
+                ("audio_fade_out", "faded_out.mp4"),
+            ):
+                output_path = temp_dir / name
+                _ = await client.call_tool(
+                    tool_name,
+                    {
+                        "input_path": str(sample_video),
+                        "output_path": str(output_path),
+                        "duration": 1.0,
+                    },
+                )
+                assert output_path.exists()
+                video_count, audio_count = _stream_counts(output_path)
+                assert video_count == 1, f"{tool_name} dropped the video stream"
+                assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_audio_fade_audio_only(
+        self, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Fade tools on an audio-only file produce an audio-only output."""
+        async with Client(mcp_server) as client:
+            for tool_name, name in (
+                ("audio_fade_in", "audio_faded_in.mp3"),
+                ("audio_fade_out", "audio_faded_out.mp3"),
+            ):
+                output_path = temp_dir / name
+                _ = await client.call_tool(
+                    tool_name,
+                    {
+                        "input_path": str(sample_audio),
+                        "output_path": str(output_path),
+                        "duration": 1.0,
+                    },
+                )
+                assert output_path.exists()
+                video_count, audio_count = _stream_counts(output_path)
+                assert video_count == 0
+                assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_mix_audio_workflow(
+        self, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """mix_audio combines two audio tracks into a single output."""
+        # Build a second audio source at a different frequency.
+        second_audio = temp_dir / "second_audio.mp3"
+        (
+            ffmpeg.input("sine=frequency=880:duration=3", f="lavfi")
+            .output(str(second_audio), acodec="mp3", audio_bitrate="192k")
+            .overwrite_output()
+            .run(quiet=True)
+        )
+
+        async with Client(mcp_server) as client:
+            output_path = temp_dir / "mixed.mp3"
+            _ = await client.call_tool(
+                "mix_audio",
+                {
+                    "audio1_path": str(sample_audio),
+                    "audio2_path": str(second_audio),
+                    "output_path": str(output_path),
+                    "audio1_volume": 0.5,
+                    "audio2_volume": 0.5,
+                },
+            )
+            assert output_path.exists()
+            video_count, audio_count = _stream_counts(output_path)
+            assert video_count == 0
+            assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_normalize_loudness_preserves_video(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """normalize_loudness on a video keeps the video and normalizes audio."""
+        async with Client(mcp_server) as client:
+            output_path = temp_dir / "normalized_video.mp4"
+            _ = await client.call_tool(
+                "normalize_loudness",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(output_path),
+                    "target_i": -14.0,
+                    "target_tp": -1.0,
+                    "target_lra": 11.0,
+                },
+            )
+            assert output_path.exists()
+            video_count, audio_count = _stream_counts(output_path)
+            assert video_count == 1
+            assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_normalize_loudness_audio_only(
+        self, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """normalize_loudness on an audio-only file stays audio-only."""
+        async with Client(mcp_server) as client:
+            output_path = temp_dir / "normalized_audio.wav"
+            _ = await client.call_tool(
+                "normalize_loudness",
+                {
+                    "input_path": str(sample_audio),
+                    "output_path": str(output_path),
+                },
+            )
+            assert output_path.exists()
+            video_count, audio_count = _stream_counts(output_path)
+            assert video_count == 0
+            assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_normalize_loudness_invalid_target(
+        self, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Out-of-range loudness targets must be rejected."""
+        async with Client(mcp_server) as client:
+            with pytest.raises((ValueError, RuntimeError, ToolError)):
+                await client.call_tool(
+                    "normalize_loudness",
+                    {
+                        "input_path": str(sample_audio),
+                        "output_path": str(temp_dir / "bad.mp3"),
+                        "target_i": 10.0,  # Above the -5.0 ceiling
+                    },
+                )
+
+    @pytest.mark.integration
     async def test_audio_synchronization_workflow(
-        self, sample_video: Path, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+        self,
+        sample_video: Path,
+        sample_audio: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
     ) -> None:
         """Test audio synchronization and duration matching.
 
@@ -231,7 +529,7 @@ class TestAudioProcessingE2E:
             _ = await client.call_tool(
                 "add_audio",
                 {
-                    "video_path": str(sample_video),
+                    "input_path": str(sample_video),
                     "audio_path": str(long_audio_path),
                     "output_path": str(replace_long_path),
                     "replace": True,
@@ -250,7 +548,7 @@ class TestAudioProcessingE2E:
             _ = await client.call_tool(
                 "add_audio",
                 {
-                    "video_path": str(sample_video),
+                    "input_path": str(sample_video),
                     "audio_path": str(long_audio_path),
                     "output_path": str(mix_long_path),
                     "replace": False,
@@ -291,7 +589,7 @@ class TestAudioProcessingE2E:
             _ = await client.call_tool(
                 "add_audio",
                 {
-                    "video_path": str(sample_video),
+                    "input_path": str(sample_video),
                     "audio_path": str(hq_audio_path),
                     "output_path": str(hq_video_path),
                     "replace": True,
@@ -315,16 +613,18 @@ class TestAudioProcessingE2E:
             # Verify audio properties are maintained
             for audio_path in [hq_audio_path, extracted_again_path]:
                 probe = ffmpeg.probe(str(audio_path))
-                audio_stream = next(
-                    s for s in probe["streams"] if s["codec_type"] == "audio"
-                )
+                _ = next(s for s in probe["streams"] if s["codec_type"] == "audio")
                 # Duration should be approximately the same
                 duration = float(probe["format"]["duration"])
                 assert 4.9 <= duration <= 5.1
 
     @pytest.mark.integration
     async def test_audio_processing_with_video_operations(
-        self, sample_video: Path, sample_audio: Path, temp_dir: Path, mcp_server: FastMCP[None]
+        self,
+        sample_video: Path,
+        sample_audio: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
     ) -> None:
         """Test audio processing combined with video operations.
 
@@ -375,7 +675,7 @@ class TestAudioProcessingE2E:
             _ = await client.call_tool(
                 "add_audio",
                 {
-                    "video_path": str(resized_video_path),
+                    "input_path": str(resized_video_path),
                     "audio_path": str(sample_audio),
                     "output_path": str(final_video_path),
                     "replace": True,
@@ -406,7 +706,12 @@ class TestAudioProcessingE2E:
             assert audio_stream["codec_name"] == "aac"
 
     @pytest.mark.integration
-    async def test_audio_error_handling(self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_audio_error_handling(
+        self,
+        sample_video: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
         """Test error handling in audio processing operations.
 
         This test verifies that audio processing tools handle errors
@@ -425,7 +730,7 @@ class TestAudioProcessingE2E:
                 )
 
             # Test invalid audio format
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises((ValueError, RuntimeError, ToolError)):
                 await client.call_tool(
                     "extract_audio",
                     {
@@ -436,11 +741,11 @@ class TestAudioProcessingE2E:
                 )
 
             # Test adding audio with invalid volume
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises((ValueError, RuntimeError, ToolError)):
                 await client.call_tool(
                     "add_audio",
                     {
-                        "video_path": str(sample_video),
+                        "input_path": str(sample_video),
                         "audio_path": str(sample_video),
                         "output_path": str(temp_dir / "output.mp4"),
                         "audio_volume": 5.0,  # Too high
@@ -448,11 +753,11 @@ class TestAudioProcessingE2E:
                 )
 
             # Test adding audio with negative volume
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises((ValueError, RuntimeError, ToolError)):
                 await client.call_tool(
                     "add_audio",
                     {
-                        "video_path": str(sample_video),
+                        "input_path": str(sample_video),
                         "audio_path": str(sample_video),
                         "output_path": str(temp_dir / "output.mp4"),
                         "audio_volume": -0.5,  # Negative
@@ -464,7 +769,7 @@ class TestAudioProcessingE2E:
                 await client.call_tool(
                     "add_audio",
                     {
-                        "video_path": str(sample_video),
+                        "input_path": str(sample_video),
                         "audio_path": "nonexistent_audio.mp3",
                         "output_path": str(temp_dir / "output.mp4"),
                         "replace": True,
@@ -476,7 +781,7 @@ class TestAudioProcessingE2E:
                 await client.call_tool(
                     "add_audio",
                     {
-                        "video_path": "nonexistent_video.mp4",
+                        "input_path": "nonexistent_video.mp4",
                         "audio_path": str(sample_video),
                         "output_path": str(temp_dir / "output.mp4"),
                         "replace": True,
@@ -484,7 +789,12 @@ class TestAudioProcessingE2E:
                 )
 
     @pytest.mark.integration
-    async def test_audio_bitrate_variations(self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_audio_bitrate_variations(
+        self,
+        sample_video: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
         """Test audio extraction with different bitrate settings.
 
         This test verifies that different bitrate settings work correctly
