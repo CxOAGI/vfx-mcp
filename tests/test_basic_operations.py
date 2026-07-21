@@ -19,6 +19,27 @@ if TYPE_CHECKING:
     from fastmcp import FastMCP
 
 
+@pytest.fixture(autouse=True)
+def _allow_absolute_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit the absolute temp-dir paths used throughout these tests.
+
+    The workspace sandbox (``safe_input_path``/``safe_output_path``) rejects
+    paths outside the workspace root unless ``VFX_ALLOW_ABSOLUTE`` is set. The
+    fixtures write to ``tempfile.mkdtemp()`` directories, so tests opt into
+    absolute paths here rather than relocating every fixture into the CWD.
+    """
+    monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+
+
+def _stream_counts(video_path: Path) -> tuple[int, int]:
+    """Return ``(video_stream_count, audio_stream_count)`` for a file."""
+    probe = ffmpeg.probe(str(video_path))
+    streams = cast("list[dict[str, str]]", probe["streams"])
+    video = sum(1 for s in streams if s.get("codec_type") == "video")
+    audio = sum(1 for s in streams if s.get("codec_type") == "audio")
+    return video, audio
+
+
 class VideoStreamInfo(TypedDict):
     """Type definition for video stream information."""
 
@@ -249,6 +270,12 @@ class TestBasicOperations:
             duration: float = float(probe_data["format"]["duration"])
             assert 5.9 <= duration <= 6.1
 
+            # Homogeneous audio-bearing inputs must yield exactly one video and
+            # one audio stream (guards against the C1/C4 multi-track regression).
+            video_count, audio_count = _stream_counts(output_path)
+            assert video_count == 1
+            assert audio_count == 1
+
     @pytest.mark.unit
     async def test_concatenate_videos_error_handling(
         self, sample_video: Path, mcp_server: FastMCP[None]
@@ -308,7 +335,9 @@ class TestResourceEndpoints:
                 assert isinstance(videos_list, list)
 
                 # Verify our test videos are listed
-                video_names: list[str] = [Path(cast(str, v)).name for v in cast(list[object], videos_list)]
+                video_names: list[str] = [
+                    Path(cast(str, v)).name for v in cast(list[object], videos_list)
+                ]
                 for test_video in sample_videos:
                     assert test_video.name in video_names
         finally:
@@ -352,3 +381,314 @@ class TestResourceEndpoints:
         finally:
             # Restore original working directory
             os.chdir(original_cwd)
+
+
+class TestConcatenation:
+    """Test suite covering the rewritten concatenate_videos tool (C1/C2)."""
+
+    @pytest.mark.integration
+    async def test_concatenate_two_videos(
+        self, sample_videos: list[Path], temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Concatenating exactly two clips works (2-input concat shape)."""
+        output_path: Path = temp_dir / "concat_two.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "concatenate_videos",
+                {
+                    "input_paths": [str(v) for v in sample_videos[:2]],
+                    "output_path": str(output_path),
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        duration = float(probe_data["format"]["duration"])
+        assert 3.9 <= duration <= 4.2
+        video_count, audio_count = _stream_counts(output_path)
+        assert video_count == 1
+        assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_concatenate_three_videos(
+        self, sample_videos: list[Path], temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Concatenating three clips works (previously threw a ValueError)."""
+        output_path: Path = temp_dir / "concat_three.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "concatenate_videos",
+                {
+                    "input_paths": [str(v) for v in sample_videos],
+                    "output_path": str(output_path),
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        duration = float(probe_data["format"]["duration"])
+        assert 5.9 <= duration <= 6.1
+
+    @pytest.mark.integration
+    async def test_concatenate_silent_videos(
+        self,
+        sample_videos_silent: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Silent inputs concatenate into a valid, audio-less output."""
+        output_path: Path = temp_dir / "concat_silent.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "concatenate_videos",
+                {
+                    "input_paths": [str(v) for v in sample_videos_silent],
+                    "output_path": str(output_path),
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        duration = float(probe_data["format"]["duration"])
+        assert 5.9 <= duration <= 6.1
+        video_count, audio_count = _stream_counts(output_path)
+        assert video_count == 1
+        assert audio_count == 0
+
+    @pytest.mark.integration
+    async def test_concatenate_mixed_audio(
+        self,
+        sample_videos: list[Path],
+        sample_videos_silent: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Mixing silent and audio-bearing clips yields one aligned audio track.
+
+        A mismatch in audio presence forces the re-encode path, which must
+        inject anullsrc for the silent clip so the concat filter aligns and the
+        output carries a single audio stream.
+        """
+        output_path: Path = temp_dir / "concat_mixed.mp4"
+        inputs = [
+            str(sample_videos[0]),
+            str(sample_videos_silent[0]),
+            str(sample_videos[1]),
+        ]
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "concatenate_videos",
+                {"input_paths": inputs, "output_path": str(output_path)},
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        duration = float(probe_data["format"]["duration"])
+        assert 5.9 <= duration <= 6.1
+        video_count, audio_count = _stream_counts(output_path)
+        assert video_count == 1
+        assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_concatenate_heterogeneous(
+        self,
+        sample_videos_heterogeneous: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Clips with mismatched resolution/fps are normalized then joined."""
+        output_path: Path = temp_dir / "concat_hetero.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "concatenate_videos",
+                {
+                    "input_paths": [str(v) for v in sample_videos_heterogeneous],
+                    "output_path": str(output_path),
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        duration = float(probe_data["format"]["duration"])
+        assert 5.9 <= duration <= 6.1
+        # Normalization pads to the largest input (1280x720).
+        video_stream = next(
+            s for s in probe_data["streams"] if s["codec_type"] == "video"
+        )
+        assert video_stream["width"] == 1280
+        assert video_stream["height"] == 720
+        video_count, audio_count = _stream_counts(output_path)
+        assert video_count == 1
+        assert audio_count == 1
+
+    @pytest.mark.integration
+    async def test_concatenate_force_re_encode(
+        self, sample_videos: list[Path], temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """re_encode=True forces the filter path even on homogeneous inputs."""
+        output_path: Path = temp_dir / "concat_reencode.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "concatenate_videos",
+                {
+                    "input_paths": [str(v) for v in sample_videos],
+                    "output_path": str(output_path),
+                    "re_encode": True,
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        duration = float(probe_data["format"]["duration"])
+        assert 5.9 <= duration <= 6.1
+        video_count, audio_count = _stream_counts(output_path)
+        assert video_count == 1
+        assert audio_count == 1
+
+
+class TestTransforms:
+    """Test suite for resize, trim (accurate) and image_to_video edge cases."""
+
+    @pytest.mark.integration
+    async def test_resize_odd_dimensions_by_scale(
+        self,
+        sample_video_odd_dims: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Odd-sized source scaled by a factor yields even output dimensions."""
+        output_path: Path = temp_dir / "resized_odd.mp4"
+
+        async with Client(mcp_server) as client:
+            # 641x481 * 0.5 -> trunc(320.5/1)->320 x 240 (both even).
+            await client.call_tool(
+                "resize_video",
+                {
+                    "input_path": str(sample_video_odd_dims),
+                    "output_path": str(output_path),
+                    "scale": 0.5,
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        video_stream = next(
+            s for s in probe_data["streams"] if s["codec_type"] == "video"
+        )
+        assert video_stream["width"] == 320
+        assert video_stream["height"] == 240
+        assert video_stream["width"] % 2 == 0
+        assert video_stream["height"] % 2 == 0
+
+    @pytest.mark.integration
+    async def test_resize_odd_dimensions_by_width(
+        self,
+        sample_video_odd_dims: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Auto (height) axis is forced even via -2 when resizing by width."""
+        output_path: Path = temp_dir / "resized_odd_width.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "resize_video",
+                {
+                    "input_path": str(sample_video_odd_dims),
+                    "output_path": str(output_path),
+                    "width": 300,
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        video_stream = next(
+            s for s in probe_data["streams"] if s["codec_type"] == "video"
+        )
+        assert video_stream["width"] == 300
+        assert video_stream["height"] % 2 == 0
+
+    @pytest.mark.integration
+    async def test_trim_video_accurate(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """Accurate mode re-encodes and produces the requested duration."""
+        output_path: Path = temp_dir / "trimmed_accurate.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "trim_video",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(output_path),
+                    "start_time": 1.0,
+                    "duration": 2.0,
+                    "accurate": True,
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        duration = float(probe_data["format"]["duration"])
+        assert 1.9 <= duration <= 2.2
+        video_stream = next(
+            s for s in probe_data["streams"] if s["codec_type"] == "video"
+        )
+        assert video_stream["codec_name"] == "h264"
+
+    @pytest.mark.unit
+    async def test_trim_video_rejects_zero_duration(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """duration=0 must be rejected rather than treated as 'to end'."""
+        output_path: Path = temp_dir / "trim_zero.mp4"
+
+        async with Client(mcp_server) as client:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool(
+                    "trim_video",
+                    {
+                        "input_path": str(sample_video),
+                        "output_path": str(output_path),
+                        "start_time": 1.0,
+                        "duration": 0.0,
+                    },
+                )
+
+        assert "duration" in str(exc_info.value).lower()
+
+    @pytest.mark.integration
+    async def test_image_to_video(
+        self, sample_image: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """A still image is turned into a video of the requested duration."""
+        output_path: Path = temp_dir / "image_video.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "image_to_video",
+                {
+                    "image_path": str(sample_image),
+                    "output_path": str(output_path),
+                    "duration": 3.0,
+                    "framerate": 24,
+                },
+            )
+
+        assert output_path.exists()
+        probe_data = cast(ProbeData, ffmpeg.probe(str(output_path)))
+        duration = float(probe_data["format"]["duration"])
+        assert 2.8 <= duration <= 3.3
+        video_stream = next(
+            s for s in probe_data["streams"] if s["codec_type"] == "video"
+        )
+        assert video_stream["width"] == 1280
+        assert video_stream["height"] == 720
+        assert video_stream["width"] % 2 == 0
+        assert video_stream["height"] % 2 == 0

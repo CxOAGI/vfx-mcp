@@ -37,7 +37,7 @@ class TestBasicVideoOperationsE2E:
         """
         async with Client(mcp_server) as client:
             # Step 1: Get original video info
-            _ = await client.call_tool(
+            info_result = await client.call_tool(
                 "get_video_info",
                 {"video_path": str(sample_video)},
             )
@@ -86,7 +86,9 @@ class TestBasicVideoOperationsE2E:
             assert 1.9 <= final_info["duration"] <= 2.1
 
     @pytest.mark.integration
-    async def test_image_to_video_workflow(self, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_image_to_video_workflow(
+        self, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test creating video from image and then processing it.
 
         This test creates a video from a static image, then applies
@@ -95,10 +97,14 @@ class TestBasicVideoOperationsE2E:
         """
         # Create a simple test image using ffmpeg
         image_path = temp_dir / "test_image.png"
-        stream = ffmpeg.input(
+        stream = (
+            ffmpeg.input(
                 "testsrc=duration=1:size=640x480:rate=1",
                 f="lavfi",
-            ).output(str(image_path), vframes=1).overwrite_output()
+            )
+            .output(str(image_path), vframes=1)
+            .overwrite_output()
+        )
         ffmpeg.run(stream, quiet=True)
 
         async with Client(mcp_server) as client:
@@ -116,7 +122,7 @@ class TestBasicVideoOperationsE2E:
             assert video_path.exists()
 
             # Step 2: Verify video properties
-            _ = await client.call_tool(
+            info_result = await client.call_tool(
                 "get_video_info",
                 {"video_path": str(video_path)},
             )
@@ -207,7 +213,9 @@ class TestBasicVideoOperationsE2E:
             assert video_stream["width"] == 320  # Maintains aspect ratio
 
     @pytest.mark.integration
-    async def test_resize_variations_workflow(self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_resize_variations_workflow(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test different resize operations in a workflow.
 
         This test applies various resize operations to verify all
@@ -279,7 +287,9 @@ class TestBasicVideoOperationsE2E:
             assert video_stream["height"] == 1080  # 720 * 1.5
 
     @pytest.mark.integration
-    async def test_trim_variations_workflow(self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_trim_variations_workflow(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test different trim operations in a workflow.
 
         This test applies various trim operations to verify all
@@ -295,6 +305,7 @@ class TestBasicVideoOperationsE2E:
                     "output_path": str(trim_duration_path),
                     "start_time": 0.5,
                     "duration": 1.5,
+                    "accurate": True,
                 },
             )
             assert trim_duration_path.exists()
@@ -340,7 +351,9 @@ class TestBasicVideoOperationsE2E:
             assert 2.4 <= duration <= 2.6
 
     @pytest.mark.integration
-    async def test_error_handling_workflow(self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]) -> None:
+    async def test_error_handling_workflow(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
         """Test error handling in basic video operations.
 
         This test verifies that basic video operations handle errors

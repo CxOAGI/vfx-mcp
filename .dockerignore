@@ -1,0 +1,39 @@
+# Version control
+.git
+.gitignore
+
+# Documentation site and markdown (README is force-included below)
+docs
+*.md
+CODE_REVIEW_FINDINGS.md
+
+# Python caches and build artifacts
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+
+# Virtual environments
+.venv
+venv
+
+# Test artifacts and caches
+.pytest_cache
+.mypy_cache
+.ruff_cache
+htmlcov
+.coverage
+tests/output
+
+# Editor / OS cruft
+.DS_Store
+.idea
+.vscode
+
+# Nix build outputs
+result
+result-*
+
+# Keep the README available inside the image
+!README.md

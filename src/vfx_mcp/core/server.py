@@ -19,6 +19,8 @@ Example:
         # Server is ready to handle MCP requests
 """
 
+import os
+
 from fastmcp import FastMCP
 
 
@@ -81,3 +83,60 @@ def create_mcp_server() -> FastMCP[None]:
     register_resource_endpoints(mcp)
 
     return mcp
+
+
+def main(server: FastMCP[None] | None = None) -> None:
+    """Console entry point for the VFX MCP server.
+
+    Runs the configured server using the transport selected via environment
+    variables. This is the target of the ``vfx-mcp`` console script declared in
+    ``pyproject.toml``.
+
+    Args:
+        server: An already-built server to run. When ``None`` (the console
+            script case) a fresh one is created via :func:`create_mcp_server`.
+            ``main.py`` passes its module-level instance so the server is built
+            exactly once instead of a second time here.
+
+    Environment Variables:
+        MCP_TRANSPORT: Transport protocol to use. One of ``stdio`` (default),
+            ``sse``, ``http`` (alias for ``streamable-http``), or
+            ``streamable-http``.
+        MCP_HOST: Host interface to bind when using an HTTP-based transport.
+            Defaults to ``127.0.0.1``. Ignored for ``stdio``.
+        MCP_PORT: TCP port to bind when using an HTTP-based transport.
+            Defaults to ``8000``. Ignored for ``stdio``.
+
+    Raises:
+        ValueError: If ``MCP_TRANSPORT`` is not a recognized transport or if
+            ``MCP_PORT`` is not a valid integer.
+    """
+    if server is None:
+        server = create_mcp_server()
+
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
+
+    if transport == "stdio":
+        server.run(transport="stdio")
+        return
+
+    # Map the documented "http" alias onto FastMCP's streamable-http transport.
+    if transport == "http":
+        transport = "streamable-http"
+
+    if transport not in {"sse", "streamable-http"}:
+        raise ValueError(
+            f"Unknown MCP_TRANSPORT {transport!r}; expected one of "
+            "'stdio', 'sse', 'http', or 'streamable-http'."
+        )
+
+    host = os.environ.get("MCP_HOST", "127.0.0.1")
+    port_str = os.environ.get("MCP_PORT", "8000")
+    try:
+        port = int(port_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid MCP_PORT {port_str!r}; expected an integer."
+        ) from exc
+
+    server.run(transport=transport, host=host, port=port)

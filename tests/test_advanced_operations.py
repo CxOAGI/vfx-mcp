@@ -579,3 +579,247 @@ class TestErrorHandling:
                         "filter": "nonexistent_filter",
                     },
                 )
+
+
+# Pixel formats that actually carry an alpha channel. A "transparent
+# background" green-screen result is only honest if the probed output uses one
+# of these; yuv420p (the standard H.264 output) has no alpha.
+_ALPHA_PIXEL_FORMATS: frozenset[str] = frozenset(
+    {"argb", "rgba", "abgr", "bgra", "yuva420p", "yuva444p", "yuva422p"}
+)
+
+
+def _build_transparent_stream(
+    input_path: str, output_path: str, vcodec: str, pix_fmt: str
+) -> ffmpeg.Stream:
+    """Build the transparent (alpha) chroma-key graph the tool produces."""
+    input_stream = ffmpeg.input(input_path)
+    keyed = ffmpeg.filter(
+        input_stream, "chromakey", color="0x00FF00", similarity=0.3, blend=0.1
+    )
+    keyed = ffmpeg.filter(keyed, "despill", type="green", mix=0.5)
+    return ffmpeg.output(keyed, output_path, vcodec=vcodec, pix_fmt=pix_fmt)
+
+
+def _build_composite_stream(
+    input_path: str, background_path: str, output_path: str
+) -> ffmpeg.Stream:
+    """Build the composited chroma-key graph the tool produces."""
+    input_stream = ffmpeg.input(input_path)
+    keyed = ffmpeg.filter(
+        input_stream, "chromakey", color="0x00FF00", similarity=0.3, blend=0.1
+    )
+    keyed = ffmpeg.filter(keyed, "despill", type="green", mix=0.5)
+    background = ffmpeg.input(background_path)
+    composited = ffmpeg.filter([background, keyed], "overlay", x="(W-w)/2", y="(H-h)/2")
+    return ffmpeg.output(
+        composited,
+        output_path,
+        vcodec="libx264",
+        pix_fmt="yuv420p",
+        acodec="aac",
+        map="1:a?",
+    )
+
+
+class TestGreenScreenEffect:
+    """Test suite for create_green_screen_effect compositing."""
+
+    @pytest.mark.unit
+    def test_transparent_command_shape_mov(self) -> None:
+        """The transparent .mov path compiles to an alpha-capable codec.
+
+        Verifies via ffmpeg.get_args (no binary needed) that the transparent
+        output uses qtrle + argb, which genuinely carries an alpha channel,
+        rather than the H.264/yuv420p output that silently drops transparency.
+        """
+        args = _build_transparent_stream(
+            "in.mp4", "out.mov", "qtrle", "argb"
+        ).get_args()
+        assert "qtrle" in args
+        assert "argb" in args
+        assert "chromakey" in " ".join(args)
+
+    @pytest.mark.unit
+    def test_composite_command_shape_maps_source_audio(self) -> None:
+        """The composited path overlays and maps the *source* video's audio.
+
+        Verifies the command overlays the keyed foreground and maps audio from
+        input index 1 (the source), not input 0 (the background).
+        """
+        args = _build_composite_stream("src.mp4", "bg.mp4", "out.mp4").get_args()
+        joined = " ".join(args)
+        assert "overlay" in joined
+        assert "1:a?" in args
+        # The source video is the second input (-i), so 1:a is its audio.
+        input_files = [args[i + 1] for i, a in enumerate(args) if a == "-i"]
+        assert input_files[1] == "src.mp4"
+
+    @pytest.mark.integration
+    async def test_transparent_output_has_alpha(
+        self,
+        sample_video: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A transparent (no-background) result must have a real alpha channel.
+
+        Exercises the M6 fix: without a background the tool must emit an
+        alpha-capable format. Probes the output pixel format and asserts it
+        carries alpha (not yuv420p).
+        """
+        monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+        output_path: Path = temp_dir / "transparent.mov"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "create_green_screen_effect",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(output_path),
+                    "chroma_key_color": "green",
+                },
+            )
+
+            assert output_path.exists()
+
+            probe_result = ffmpeg.probe(str(output_path))
+            probe_data = cast(ProbeData, probe_result)
+            video_stream = next(
+                s for s in probe_data["streams"] if s["codec_type"] == "video"
+            )
+            pix_fmt = cast(dict[str, str], video_stream).get("pix_fmt", "")
+            assert pix_fmt in _ALPHA_PIXEL_FORMATS, (
+                f"transparent output pix_fmt {pix_fmt!r} has no alpha channel"
+            )
+
+    @pytest.mark.integration
+    async def test_transparent_rejects_non_alpha_extension(
+        self,
+        sample_video: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Requesting transparency with a non-alpha container is rejected.
+
+        An .mp4 (H.264/yuv420p) cannot carry alpha, so the transparent path
+        must fail fast rather than silently producing an opaque video.
+        """
+        monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+        output_path: Path = temp_dir / "not_transparent.mp4"
+
+        async with Client(mcp_server) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "create_green_screen_effect",
+                    {
+                        "input_path": str(sample_video),
+                        "output_path": str(output_path),
+                    },
+                )
+
+    @pytest.mark.integration
+    async def test_composited_path_has_video_and_audio(
+        self,
+        sample_video: Path,
+        sample_videos: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Compositing over a background yields a standard video with audio.
+
+        Uses a video background so the overlay produces real frames, then
+        asserts the output has both a video stream and the source video's
+        audio track (mapped from input index 1).
+        """
+        monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+        output_path: Path = temp_dir / "composited.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "create_green_screen_effect",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(output_path),
+                    "background_path": str(sample_videos[0]),
+                    "chroma_key_color": "green",
+                },
+            )
+
+            assert output_path.exists()
+
+            probe_result = ffmpeg.probe(str(output_path))
+            probe_data = cast(ProbeData, probe_result)
+            video_stream = next(
+                (s for s in probe_data["streams"] if s["codec_type"] == "video"),
+                None,
+            )
+            audio_stream = next(
+                (s for s in probe_data["streams"] if s["codec_type"] == "audio"),
+                None,
+            )
+            assert video_stream is not None
+            assert audio_stream is not None
+
+
+class TestMotionBlur:
+    """Test suite for apply_motion_blur."""
+
+    @pytest.mark.integration
+    async def test_motion_blur_preserves_dimensions(
+        self,
+        sample_video: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Motion blur produces a valid video at the source dimensions."""
+        monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+        output_path: Path = temp_dir / "motion_blur.mp4"
+
+        async with Client(mcp_server) as client:
+            await client.call_tool(
+                "apply_motion_blur",
+                {
+                    "input_path": str(sample_video),
+                    "output_path": str(output_path),
+                    "blur_strength": 1.0,
+                    "angle": 0.0,
+                },
+            )
+
+            assert output_path.exists()
+
+            probe_result = ffmpeg.probe(str(output_path))
+            probe_data = cast(ProbeData, probe_result)
+            video_stream = next(
+                s for s in probe_data["streams"] if s["codec_type"] == "video"
+            )
+            assert cast(VideoStreamInfo, video_stream)["width"] == 1280
+            assert cast(VideoStreamInfo, video_stream)["height"] == 720
+
+    @pytest.mark.integration
+    async def test_motion_blur_invalid_strength(
+        self,
+        sample_video: Path,
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Out-of-range blur strength is rejected before encoding."""
+        monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+        output_path: Path = temp_dir / "motion_blur_bad.mp4"
+
+        async with Client(mcp_server) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "apply_motion_blur",
+                    {
+                        "input_path": str(sample_video),
+                        "output_path": str(output_path),
+                        "blur_strength": 99.0,
+                    },
+                )

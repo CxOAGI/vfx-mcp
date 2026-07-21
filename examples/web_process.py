@@ -24,6 +24,7 @@ from fastmcp import Client
 
 class VideoInfo(TypedDict):
     """Type definition for video stream information."""
+
     width: int
     height: int
     codec: str
@@ -31,6 +32,7 @@ class VideoInfo(TypedDict):
 
 class VideoMetadata(TypedDict):
     """Type definition for video metadata returned by get_video_info."""
+
     filename: str
     format: str
     duration: float
@@ -82,7 +84,7 @@ async def process_for_web(
                     result_text = "{}"
             else:
                 result_text = "{}"
-            
+
             info: VideoMetadata = cast(VideoMetadata, json.loads(result_text))
 
             # Type-safe access to video info

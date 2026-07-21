@@ -39,13 +39,13 @@ Yes, the VFX MCP Server is open source and free to use. However, you'll need:
 ### What are the system requirements?
 
 **Minimum Requirements**:
-- Python 3.9 or higher
+- Python 3.13 or higher
 - FFmpeg (latest version)
 - 4GB RAM
 - 2GB available disk space
 
 **Recommended**:
-- Python 3.11+
+- Python 3.13+
 - 8GB+ RAM
 - SSD storage
 - Multi-core processor
@@ -227,7 +227,7 @@ await session.call_tool("apply_filter", {
 
 2. **Check Python version**:
    ```bash
-   python --version  # Should be 3.9+
+   python --version  # Should be 3.13+
    ```
 
 3. **Install dependencies**:
@@ -437,4 +437,4 @@ The server is designed to be extensible. You can:
 
 ---
 
-**Still have questions?** Check the [troubleshooting guide](/support/troubleshooting/) or [file an issue](https://github.com/conneroisu/vfx-mcp/issues) on GitHub.
+**Still have questions?** Check the [troubleshooting guide](/support/troubleshooting/) or [file an issue](https://github.com/CxOAGI/vfx-mcp/issues) on GitHub.

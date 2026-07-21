@@ -19,6 +19,20 @@ if TYPE_CHECKING:
     from fastmcp import FastMCP
 
 
+@pytest.fixture(autouse=True)
+def _allow_absolute_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit the absolute temp-dir paths the tests use through the sandbox.
+
+    The video-effects tools now validate every path with
+    :func:`vfx_mcp.core.validation.safe_input_path` /
+    :func:`~vfx_mcp.core.validation.safe_output_path`, which reject paths
+    outside the workspace root unless ``VFX_ALLOW_ABSOLUTE`` is set. The test
+    fixtures write to an absolute temporary directory, so enable that escape
+    hatch for the duration of each test.
+    """
+    monkeypatch.setenv("VFX_ALLOW_ABSOLUTE", "1")
+
+
 class VideoStreamInfo(TypedDict):
     """Type definition for video stream information."""
 
@@ -184,6 +198,55 @@ class TestVideoEffectsE2E:
                     },
                 )
                 assert thumb_path.exists()
+
+    @pytest.mark.integration
+    async def test_change_speed_on_silent_video(
+        self,
+        sample_videos_silent: list[Path],
+        temp_dir: Path,
+        mcp_server: FastMCP[None],
+    ) -> None:
+        """Test change_speed on a video that has no audio stream (H4).
+
+        Silent inputs (e.g. Veo 2 output) previously crashed change_speed
+        because it unconditionally mapped ``stream["a"]``. The tool must now
+        detect the missing audio stream, adjust only the video PTS, and produce
+        a valid video-only output whose duration reflects the speed change.
+        """
+        silent_video: Path = sample_videos_silent[0]
+
+        # Confirm the fixture really has no audio stream.
+        source_probe = cast(ProbeData, ffmpeg.probe(str(silent_video)))
+        assert not any(s["codec_type"] == "audio" for s in source_probe["streams"])
+        source_duration = float(source_probe["format"]["duration"])
+
+        async with Client(mcp_server) as client:
+            fast_path: Path = temp_dir / "silent_fast.mp4"
+            await client.call_tool(
+                "change_speed",
+                {
+                    "input_path": str(silent_video),
+                    "output_path": str(fast_path),
+                    "speed": 2.0,
+                },
+            )
+            assert fast_path.exists()
+
+            out_probe = cast(ProbeData, ffmpeg.probe(str(fast_path)))
+
+            # Output has a video stream and NO audio stream.
+            video_streams = [
+                s for s in out_probe["streams"] if s["codec_type"] == "video"
+            ]
+            audio_streams = [
+                s for s in out_probe["streams"] if s["codec_type"] == "audio"
+            ]
+            assert len(video_streams) == 1
+            assert len(audio_streams) == 0
+
+            # Duration should be roughly halved by the 2x speed-up.
+            out_duration = float(out_probe["format"]["duration"])
+            assert abs(out_duration - source_duration / 2.0) < 0.5
 
     @pytest.mark.integration
     async def test_filter_combinations_workflow(
@@ -517,7 +580,8 @@ class TestVideoEffectsE2E:
                 assert video_stream["height"] == 720
 
                 # Generate thumbnail to visually verify effect
-                thumb_path: Path = temp_dir / f"{filename.replace('.mp4', '_thumb.jpg')}"
+                thumb_name = filename.replace(".mp4", "_thumb.jpg")
+                thumb_path: Path = temp_dir / thumb_name
                 await client.call_tool(
                     "generate_thumbnail",
                     {
@@ -606,29 +670,29 @@ class TestVideoEffectsE2E:
                 )
 
             # Test invalid speed value (too low)
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(ToolError):
                 await client.call_tool(
                     "change_speed",
                     {
                         "input_path": str(sample_video),
                         "output_path": str(temp_dir / "output.mp4"),
-                        "speed": 0.1,  # Too low
+                        "speed": 0.05,  # Too low (below inclusive 0.1 bound)
                     },
                 )
 
             # Test invalid speed value (too high)
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(ToolError):
                 await client.call_tool(
                     "change_speed",
                     {
                         "input_path": str(sample_video),
                         "output_path": str(temp_dir / "output.mp4"),
-                        "speed": 10.0,  # Too high
+                        "speed": 11.0,  # Too high (above inclusive 10.0 bound)
                     },
                 )
 
             # Test invalid speed value (zero)
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(ToolError):
                 await client.call_tool(
                     "change_speed",
                     {
@@ -639,7 +703,7 @@ class TestVideoEffectsE2E:
                 )
 
             # Test invalid filter strength (too low)
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(ToolError):
                 await client.call_tool(
                     "apply_filter",
                     {
@@ -651,7 +715,7 @@ class TestVideoEffectsE2E:
                 )
 
             # Test invalid filter strength (too high)
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(ToolError):
                 await client.call_tool(
                     "apply_filter",
                     {
@@ -663,7 +727,7 @@ class TestVideoEffectsE2E:
                 )
 
             # Test invalid thumbnail dimensions (too small)
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(ToolError):
                 await client.call_tool(
                     "generate_thumbnail",
                     {
@@ -675,7 +739,7 @@ class TestVideoEffectsE2E:
                 )
 
             # Test invalid thumbnail dimensions (too large)
-            with pytest.raises((ValueError, RuntimeError)):
+            with pytest.raises(ToolError):
                 await client.call_tool(
                     "generate_thumbnail",
                     {
@@ -683,17 +747,6 @@ class TestVideoEffectsE2E:
                         "output_path": str(temp_dir / "thumb.jpg"),
                         "width": 5000,  # Too large
                         "height": 3000,
-                    },
-                )
-
-            # Test thumbnail with invalid timestamp (negative)
-            with pytest.raises(ToolError):
-                await client.call_tool(
-                    "generate_thumbnail",
-                    {
-                        "input_path": str(sample_video),
-                        "output_path": str(temp_dir / "thumb.jpg"),
-                        "timestamp": -1.0,  # Negative
                     },
                 )
 
@@ -706,6 +759,22 @@ class TestVideoEffectsE2E:
                         "output_path": str(temp_dir / "output.mp4"),
                         "filter": "blur",
                         "strength": 1.0,
+                    },
+                )
+
+    @pytest.mark.integration
+    async def test_thumbnail_negative_timestamp(
+        self, sample_video: Path, temp_dir: Path, mcp_server: FastMCP[None]
+    ) -> None:
+        """A negative timestamp should be rejected by generate_thumbnail."""
+        async with Client(mcp_server) as client:
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "generate_thumbnail",
+                    {
+                        "input_path": str(sample_video),
+                        "output_path": str(temp_dir / "thumb.jpg"),
+                        "timestamp": -1.0,  # Negative
                     },
                 )
 
